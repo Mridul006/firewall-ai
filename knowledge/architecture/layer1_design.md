@@ -1,0 +1,189 @@
+# Layer 1 — Detailed Design
+
+Full technical design for the AI-driven sandboxed firewall rule generation engine.
+Reference this when building any Layer 1 component.
+
+---
+
+## Core guarantee
+**No untested rule ever reaches the live firewall.**
+This is the product's foundational promise. Every component is designed around it.
+
+---
+
+## Data flow (end to end)
+
+```
+Network interface
+  ↓
+Zeek/Suricata (traffic capture + parse into structured logs)
+  ↓
+Kafka topic: raw-traffic (producer: Zeek, consumer: ingestion service)
+  ↓
+ClickHouse table: traffic_events (time-series storage)
+  ↓
+Isolation Forest (reads last N minutes, scores anomaly per flow)
+  ↓ if anomaly_score > threshold
+Claude API (receives traffic summary, outputs candidate rule JSON)
+  ↓
+Rule parser (validates syntax, extracts fields)
+  ↓
+PostgreSQL table: candidate_rules (status: PENDING)
+  ↓
+Celery task: sandbox_test (async)
+  ↓
+Docker sandbox (isolated network namespace)
+  ↓
+tcpreplay (replays last 10 min of real traffic against candidate rule)
+  ↓
+FP scorer (measures: legitimate traffic blocked / total legitimate traffic)
+  ↓
+  ├─ FP rate > 5% → status: REJECTED, notify analyst
+  └─ FP rate ≤ 5% → status: APPROVED_PENDING (awaits human approval in HITL mode)
+                              ↓ human approves via dashboard
+                           status: LIVE → push to firewall via iptables/pf API
+```
+
+---
+
+## Database schemas
+
+### traffic_events (ClickHouse)
+```sql
+CREATE TABLE traffic_events (
+    timestamp    DateTime,
+    src_ip       String,
+    dst_ip       String,
+    src_port     UInt16,
+    dst_port     UInt16,
+    protocol     String,
+    bytes        UInt64,
+    packets      UInt32,
+    flags        String,
+    duration     Float32,
+    anomaly_score Float32
+) ENGINE = MergeTree()
+ORDER BY (timestamp, src_ip)
+TTL timestamp + INTERVAL 30 DAY;
+```
+
+### candidate_rules (PostgreSQL)
+```sql
+CREATE TABLE candidate_rules (
+    id              UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    created_at      TIMESTAMPTZ DEFAULT NOW(),
+    updated_at      TIMESTAMPTZ DEFAULT NOW(),
+    syntax          VARCHAR(20),        -- 'iptables' or 'pf'
+    command         TEXT NOT NULL,
+    description     TEXT,
+    mitre_technique VARCHAR(20),
+    confidence      FLOAT,
+    fp_rate         FLOAT,
+    status          VARCHAR(30),        -- PENDING, SANDBOX_TESTING, REJECTED, APPROVED_PENDING, LIVE, REVOKED
+    approved_by     UUID REFERENCES users(id),
+    approved_at     TIMESTAMPTZ,
+    trigger_event   JSONB,              -- the anomaly that triggered this rule
+    sandbox_result  JSONB               -- full sandbox test output
+);
+```
+
+### audit_log (PostgreSQL)
+```sql
+CREATE TABLE audit_log (
+    id          UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    timestamp   TIMESTAMPTZ DEFAULT NOW(),
+    actor_id    UUID REFERENCES users(id),
+    action      VARCHAR(50),            -- RULE_APPROVED, RULE_REJECTED, RULE_REVOKED
+    rule_id     UUID REFERENCES candidate_rules(id),
+    metadata    JSONB
+);
+```
+
+---
+
+## API endpoints (FastAPI)
+
+```
+GET    /api/v1/rules/              — list all rules with status filter
+GET    /api/v1/rules/{id}          — get single rule with full details
+POST   /api/v1/rules/{id}/approve  — human approves pending rule (HITL)
+POST   /api/v1/rules/{id}/reject   — human rejects pending rule
+POST   /api/v1/rules/{id}/revoke   — revoke a live rule
+GET    /api/v1/traffic/            — recent traffic events with anomaly scores
+GET    /api/v1/traffic/anomalies   — only anomalous events above threshold
+GET    /api/v1/dashboard/stats     — summary stats for dashboard
+WS     /api/v1/ws/alerts           — WebSocket for real-time alerts
+```
+
+---
+
+## Isolation Forest configuration
+
+```python
+from sklearn.ensemble import IsolationForest
+
+model = IsolationForest(
+    n_estimators=100,
+    contamination=0.01,   # expect 1% of traffic to be anomalous — configurable via env
+    random_state=42,
+    n_jobs=-1             # use all CPU cores
+)
+
+# Features extracted per flow for training
+FEATURES = [
+    "bytes_per_second",
+    "packets_per_second",
+    "avg_packet_size",
+    "duration",
+    "dst_port",
+    "src_port",
+    "flags_syn_ratio",
+    "flags_rst_ratio",
+    "unique_dst_ports_per_src",  # port scan indicator
+    "dns_query_entropy"          # DNS tunneling indicator
+]
+```
+
+---
+
+## Claude API prompt template (stored in knowledge/prompts/rule_gen.txt)
+
+The prompt Claude receives when generating a rule. Keep this in the prompts file, never inline.
+
+Key elements the prompt must include:
+- Traffic summary (src IP, dst IP, ports, protocol, anomaly score, anomaly type)
+- Target firewall syntax (iptables or pf)
+- Required output JSON schema
+- Instructions to minimize false positives
+- MITRE ATT&CK technique classification requirement
+- Instruction to prefer rate-limiting over outright blocking when uncertain
+
+---
+
+## Sandbox design
+
+The sandbox is a Docker container with:
+- An isolated network namespace (no access to real network)
+- A virtual interface pair (veth) for traffic injection
+- iptables pre-loaded with the candidate rule
+- tcpreplay to inject the last 10 minutes of captured real traffic
+
+FP scorer measures:
+```
+FP rate = packets blocked by rule that are NOT anomalous / total non-anomalous packets
+```
+
+Threshold: FP rate > 5% → reject rule.
+Configurable via SANDBOX_FP_THRESHOLD env var.
+
+---
+
+## MVP vs future releases
+
+| Feature | MVP (HITL) | Future (autonomous) |
+|---|---|---|
+| Rule generation | AI generates, human approves | AI generates, auto-promotes if FP < threshold |
+| Sandbox | Docker + tcpreplay | Extended simulation with adversarial traffic |
+| Anomaly detection | Isolation Forest | Ensemble: IF + LSTM autoencoder |
+| Rule syntax | iptables / pf only | Cisco ASA, Palo Alto, Fortinet |
+| Deployment | Single network | Multi-tenant, per-customer isolation |
