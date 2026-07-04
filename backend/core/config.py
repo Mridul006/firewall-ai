@@ -25,6 +25,16 @@ class Settings:
         if origin.strip()
     ]
 
+    CLICKHOUSE_HOST: str = os.getenv("CLICKHOUSE_HOST", "localhost")
+    CLICKHOUSE_PORT: int = int(os.getenv("CLICKHOUSE_PORT", "9000"))
+
+    # anomaly_score above which a traffic event counts as alert-worthy — distinct
+    # from ANOMALY_CONTAMINATION (ml/'s IsolationForest training hyperparameter,
+    # an expected-fraction, not a score cutoff). Matches the 0.5 convention
+    # already used by ml/anomaly.py's detect_anomalies() and
+    # sandbox/fp_scorer.py's ANOMALY_SCORE_THRESHOLD.
+    ANOMALY_ALERT_THRESHOLD: float = float(os.getenv("ANOMALY_ALERT_THRESHOLD", "0.5"))
+
     def __init__(self) -> None:
         if not self.POSTGRES_URL:
             raise RuntimeError("POSTGRES_URL is not set — check .env")
