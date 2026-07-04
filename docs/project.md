@@ -31,7 +31,7 @@ Live traffic
 ### Layer 2 — Multi-layer Moving Target Defense with CSPRNG rotation (BUILD THIRD)
 **What it does:** Rotates IP addresses, ports, protocols, and service fingerprints simultaneously on independent cryptographically random schedules. Each layer has its own CSPRNG-driven rotation timeline.
 
-**Core insight (Temporal Defense Layering — patented):** If each parameter rotates independently, an attacker who cracks one layer's rotation pattern still cannot predict the others. The unpredictability compounds exponentially across layers:
+**Core insight (Temporal Defense Layering — not yet patented; filing is a planned future step):** If each parameter rotates independently, an attacker who cracks one layer's rotation pattern still cannot predict the others. The unpredictability compounds exponentially across layers:
 - Attacker must solve T1 (IP schedule) × T2 (port schedule) × T3 (protocol schedule) × T4 (fingerprint schedule) simultaneously
 - Each Ti is driven by a CSPRNG — statistically unpredictable
 
@@ -120,7 +120,7 @@ No competitor combines all five layers into a single co-evolving system.
 ---
 
 ## IP and patent status
-- Provisional patent V2 filed
+- Not yet patented — filing is a planned future step
 - 7 claim groups covering: full architecture, CSPRNG rotation mechanism, Temporal Defense Layering, adversarial isolation model, configurable threshold system, cross-layer feedback loops, mutable encryption co-evolution
 - Key coined term: **Temporal Defense Layering** — multi-layer independent CSPRNG rotation where unpredictability compounds exponentially
 
