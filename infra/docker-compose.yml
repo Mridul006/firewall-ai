@@ -37,6 +37,9 @@ services:
     ports:
       - "8123:8123"
       - "9000:9000"
+    volumes:
+      - clickhouse_data:/var/lib/clickhouse
 
 volumes:
   postgres_data:
+  clickhouse_data:
