@@ -1,0 +1,9 @@
+scikit-learn==1.9.0
+numpy==2.5.0
+pandas==3.0.3
+joblib==1.5.3
+clickhouse-driver==0.2.10
+python-dotenv==1.2.2
+httpx==0.28.1
+anthropic==0.116.0
+openai==2.44.0

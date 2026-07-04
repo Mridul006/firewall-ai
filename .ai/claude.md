@@ -5,13 +5,14 @@ Firewall AI — an autonomous cybersecurity platform with 5 defense layers that 
 
 ## Current focus
 Building Layer 1 MVP — AI-driven sandboxed firewall rule generation engine.
+Backend skeleton, data ingestion pipeline, and ML core are built; next up is sandbox testing.
 
 ## Repo structure
 ```
 firewall-ai/
 ├── .ai/                  ← AI instructions (you are here)
 ├── backend/              ← FastAPI REST API
-├── ml/                   ← Isolation Forest + Claude API rule gen
+├── ml/                   ← Isolation Forest + swappable LLM rule gen (Ollama default)
 ├── sandbox/              ← Docker sandbox + tcpreplay + FP scorer
 ├── ingestion/            ← Zeek + Kafka + ClickHouse pipeline
 ├── frontend/             ← React + Vite + Tailwind dashboard
@@ -26,7 +27,7 @@ firewall-ai/
 - Stream broker: Kafka
 - Time-series store: ClickHouse
 - Anomaly detection: Isolation Forest (scikit-learn)
-- Rule generation: Claude API (claude-sonnet-4-6)
+- Rule generation: swappable LLM provider (LLM_PROVIDER env var) — Ollama/llama3.1 default (local, free, on-prem capable), Claude (claude-sonnet-4-6) and OpenAI (gpt-4o) available
 - Rule syntax: iptables / pf format
 - Sandbox: Docker + tcpreplay
 - Backend: FastAPI + PostgreSQL + Celery + Redis
@@ -34,10 +35,10 @@ firewall-ai/
 
 ## Build order
 1. Dev environment ← done
-2. FastAPI backend skeleton ← current
-3. Data ingestion (Zeek → Kafka → ClickHouse)
-4. ML core (Isolation Forest + Claude API + rule parser)
-5. Sandbox testing (Docker + tcpreplay + FP scorer)
+2. FastAPI backend skeleton ← done
+3. Data ingestion (Zeek → Kafka → ClickHouse) ← done
+4. ML core (Isolation Forest + swappable LLM rule gen) ← done
+5. Sandbox testing (Docker + tcpreplay + FP scorer, incl. firewall syntax validation) ← current
 6. Frontend dashboard (React + WebSocket alerts)
 7. Celery + Redis async jobs
 

@@ -72,3 +72,59 @@ Update this file whenever a significant decision is made.
 **Decision:** PostgreSQL for rules, audit logs, user data, and metadata.
 **Reason:** Relational structure suits rule management well (rules have states, history, approvers, timestamps). ACID compliance essential for audit trails. ClickHouse handles traffic volume; PostgreSQL handles structured business data.
 **Revisit when:** Never — PostgreSQL scales to our needs for years.
+
+---
+
+## ADR-011 — psycopg (v3, async) over asyncpg for the Postgres driver
+**Decision:** Use `psycopg[binary]` (v3) with SQLAlchemy's `postgresql+psycopg` async dialect instead of `asyncpg`.
+**Reason:** `asyncpg` ships no prebuilt Windows wheel for Python 3.14 yet, and the dev machine has no MSVC Build Tools to compile it from source. `psycopg[binary]` has a cp314 Windows wheel and SQLAlchemy 2.0 supports it as a first-class async driver.
+**Revisit when:** asyncpg publishes a Python 3.14 Windows wheel, or dev moves to Linux/WSL with build tools available.
+
+---
+
+## ADR-012 — Manual SelectorEventLoop wiring for uvicorn on Windows
+**Decision:** `backend/main.py` runs via `python main.py`, driving `uvicorn.Server.serve()` through `asyncio.run(server.serve(), loop_factory=asyncio.SelectorEventLoop)` instead of the `uvicorn` CLI or `uvicorn.run()`.
+**Reason:** uvicorn hardcodes `ProactorEventLoop` on Windows regardless of event loop policy, which psycopg's async mode cannot use (raises `InterfaceError`). uvicorn passes an explicit `loop_factory` into `asyncio.run()`, which bypasses `asyncio.set_event_loop_policy()` entirely — that fix doesn't work here.
+**Revisit when:** uvicorn exposes a way to override its Windows loop_factory default, or dev/deploy moves off Windows.
+
+---
+
+## ADR-013 — bcrypt directly instead of passlib
+**Decision:** Hash passwords with the `bcrypt` package directly (`bcrypt.hashpw` / `bcrypt.checkpw`), not `passlib.CryptContext`.
+**Reason:** `passlib` is unmaintained since 2020; its bcrypt backend self-test crashes under `bcrypt>=4.1`, which removed the silent-truncation behavior passlib's wrap-bug detector depends on (`ValueError: password cannot be longer than 72 bytes`). Calling `bcrypt` directly avoids the dependency and the bug.
+**Revisit when:** Never expected — bcrypt is actively maintained.
+
+---
+
+## ADR-014 — clickhouse-driver (native protocol, port 9000) over HTTP (port 8123)
+**Decision:** `ingestion/clickhouse.py` uses `clickhouse-driver`, which speaks ClickHouse's native protocol on port 9000, not the HTTP interface on port 8123.
+**Reason:** `clickhouse-driver` only supports the native protocol — pointing it at 8123 fails outright. Port 8123 is the more commonly known "ClickHouse port," so it's an easy mismatch to reintroduce; both ports are exposed in docker-compose for whichever client library a future service needs.
+**Revisit when:** A future service needs HTTP access (e.g. browser-based queries) — add `clickhouse-connect` alongside this, don't replace it.
+
+---
+
+## ADR-015 — Named volumes required for Postgres and ClickHouse (amends ADR-008)
+**Decision:** `infra/docker-compose.yml` mounts named volumes (`postgres_data`, `clickhouse_data`) for both stateful services.
+**Reason:** Without a named volume, container data lives in the writable layer and is lost on `docker compose down` or container recreation — discovered when a stale Postgres container (created before the compose file's current credentials existed) caused an auth mismatch after a plain restart. Named volumes make data survive container recreation, per the coding_rules requirement.
+**Revisit when:** Never for dev — production uses managed volumes/services per ADR-008.
+
+---
+
+## ADR-016 — Native PostgreSQL Windows service must stay stopped
+**Decision:** Any native PostgreSQL Windows service (found: `postgresql-x64-18`) must be stopped/disabled on dev machines; only the Docker container may bind port 5432.
+**Reason:** A native service silently intercepted TCP connections meant for the Docker Postgres container, causing password-authentication failures with no useful signal (connecting into the container directly worked fine — the failing connection was never reaching it). Directly violates the "all infrastructure via Docker" hard rule.
+**Revisit when:** Never — stop and flag any native DB service found on a dev machine going forward.
+
+---
+
+## ADR-017 — Swappable LLM provider interface, Ollama as the default
+**Decision:** Rule generation goes through an `LLMProvider` abstract interface (`generate(prompt: str) -> str`) with interchangeable backends — Ollama, Claude, OpenAI — selected at runtime by the `LLM_PROVIDER` env var via `ml/providers/factory.py`. `rule_gen.py` never imports a specific provider; it only calls the factory. Ollama (model `llama3.1`) is the default.
+**Reason:** A solo founder building an MVP shouldn't have paid-API cost or vendor risk on the critical path just to run and demo the product — Ollama is free, runs fully local/on-prem, and needs no API key, which also matters for security-conscious buyers who don't want raw traffic summaries leaving their network to a third-party LLM API. Making the interface swappable means Claude or OpenAI (generally higher quality, worth it for paying customers or harder cases) can be enabled per-deployment with one env var, with no code changes and no risk of `rule_gen.py` accidentally coupling to one vendor's SDK or error types.
+**Revisit when:** A design partner needs higher rule-generation quality than local models provide, or an enterprise deployment specifically requires (or specifically forbids) sending data to a hosted LLM API.
+
+---
+
+## ADR-018 — Prompt template braces must be escaped for str.format()
+**Decision:** The literal JSON schema block in `knowledge/prompts/rule_gen.txt` uses doubled braces (`{{ }}`) around the example object, while the actual substitution placeholders (`{traffic_summary}`, `{anomaly_score}`, etc.) stay single-braced.
+**Reason:** `rule_gen.py` loads this file and renders it with `str.format()`, per the coding_rules convention for prompt templates. `str.format()` treats every `{...}` as a substitution field, so the unescaped example JSON in the prompt raised `KeyError` on the first real run. Discovered by actually executing the rule generation flow against a local Ollama model, not just by reading the code.
+**Revisit when:** If the templating mechanism ever changes away from `str.format()` (e.g. to Jinja2), remove the brace-doubling — it's specific to this substitution method.

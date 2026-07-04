@@ -24,7 +24,7 @@ ClickHouse table: traffic_events (time-series storage)
   ↓
 Isolation Forest (reads last N minutes, scores anomaly per flow)
   ↓ if anomaly_score > threshold
-Claude API (receives traffic summary, outputs candidate rule JSON)
+LLM provider (swappable — Ollama/llama3.1 default, Claude/OpenAI available — receives traffic summary, outputs candidate rule JSON)
   ↓
 Rule parser (validates syntax, extracts fields)
   ↓
@@ -146,17 +146,37 @@ FEATURES = [
 
 ---
 
-## Claude API prompt template (stored in knowledge/prompts/rule_gen.txt)
+## Rule generation: swappable LLM provider (prompt stored in knowledge/prompts/rule_gen.txt)
 
-The prompt Claude receives when generating a rule. Keep this in the prompts file, never inline.
+Rule generation goes through a provider-agnostic interface, not a hardcoded call to one
+vendor's API:
 
-Key elements the prompt must include:
+```
+ml/rule_gen.py            — builds the prompt, calls the factory, parses the JSON response
+ml/providers/factory.py   — returns the right provider based on LLM_PROVIDER env var
+ml/providers/base.py      — LLMProvider ABC: generate(prompt: str) -> str
+ml/providers/ollama.py    — Ollama (DEFAULT — local, free, on-prem capable, model llama3.1)
+ml/providers/claude.py    — Anthropic Claude (claude-sonnet-4-6)
+ml/providers/openai.py    — OpenAI GPT (gpt-4o)
+```
+
+`rule_gen.py` never imports a specific provider — only `providers.factory`. Swapping
+providers is a one-line env var change (`LLM_PROVIDER=ollama|claude|openai`), never a
+code change. See ADR-017 in decisions.md for the reasoning (cost, on-prem privacy,
+vendor independence).
+
+The prompt template itself (`knowledge/prompts/rule_gen.txt`) is loaded from disk, never
+hardcoded inline, and is identical regardless of which provider renders it. Key elements
+the prompt must include:
 - Traffic summary (src IP, dst IP, ports, protocol, anomaly score, anomaly type)
 - Target firewall syntax (iptables or pf)
 - Required output JSON schema
 - Instructions to minimize false positives
 - MITRE ATT&CK technique classification requirement
 - Instruction to prefer rate-limiting over outright blocking when uncertain
+
+Note: the JSON schema block in the prompt file uses doubled braces (`{{ }}`) since the
+file is rendered with `str.format()` — see ADR-018.
 
 ---
 

@@ -25,7 +25,7 @@ Your job is to generate a precise, targeted firewall rule that blocks or rate-li
 7. Provide a plain-English description a security analyst can understand.
 
 ## Required output format (JSON only, no other text)
-{
+{{
   "syntax": "iptables" or "pf",
   "command": "the exact firewall rule command",
   "description": "plain English explanation of what this rule does and why",
@@ -33,4 +33,4 @@ Your job is to generate a precise, targeted firewall rule that blocks or rate-li
   "confidence": 0.0 to 1.0,
   "false_positive_risk": "low" or "medium" or "high",
   "reasoning": "brief explanation of why this rule was chosen over alternatives"
-}
+}}

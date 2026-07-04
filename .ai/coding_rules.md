@@ -168,6 +168,19 @@ prompt = f"Generate a firewall rule for this traffic: {summary}"
 
 ---
 
+## Documentation rules
+
+- After every significant feature or architecture change, update the relevant
+  docs in the same pass — do this automatically, without being asked:
+  - `knowledge/architecture/decisions.md` — append an entry for any new design
+    decision
+  - `knowledge/architecture/layerX_design.md` — update the matching layer's
+    design doc when its design changes
+  - `CLAUDE.md` — update if the tech stack or build status/current focus changed
+  - `.env.example` — add a placeholder for every new env var introduced
+
+---
+
 ## What NOT to do
 
 - Do not use LangChain, LlamaIndex, or any agent framework — call Claude API directly
