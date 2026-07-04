@@ -1,12 +1,14 @@
 # CLAUDE.md
 
 ## Project
-Firewall AI — an autonomous cybersecurity platform with 5 defense layers that actively mutates and adapts its defenses in real time. Built as a SaaS product by a solo founder (B.Tech student, graduating 2027) with an ML/AI background. Provisional patent V2 filed.
+Firewall AI — an autonomous cybersecurity platform with 5 defense layers that actively mutates and adapts its defenses in real time. Built as a SaaS product by a solo founder (B.Tech student, graduating 2027) with an ML/AI background. Not yet patented — filing is a planned future step.
 
 ## Current focus
 Building Layer 1 MVP — AI-driven sandboxed firewall rule generation engine.
-Backend skeleton, data ingestion pipeline, ML core, and sandbox testing are built;
-next up is the frontend dashboard.
+Backend skeleton, data ingestion pipeline, ML core, sandbox testing, and the frontend
+dashboard are built. The two backend gaps this left (traffic endpoints were stubs, no
+WebSocket route existed) are now closed — Layer 1 is functional end-to-end. Next up is
+Celery + Redis async jobs.
 
 ## Repo structure
 ```
@@ -32,7 +34,7 @@ firewall-ai/
 - Rule syntax: iptables / pf format
 - Sandbox: Docker + tcpreplay
 - Backend: FastAPI + PostgreSQL + Celery + Redis
-- Frontend: React + Vite + Tailwind + Recharts + WebSocket
+- Frontend: React + Vite (rolldown) + Tailwind v4 + Recharts + react-router-dom + WebSocket
 
 ## Build order
 1. Dev environment ← done
@@ -40,8 +42,9 @@ firewall-ai/
 3. Data ingestion (Zeek → Kafka → ClickHouse) ← done
 4. ML core (Isolation Forest + swappable LLM rule gen) ← done
 5. Sandbox testing (Docker + tcpreplay + FP scorer, incl. firewall syntax validation) ← done
-6. Frontend dashboard (React + WebSocket alerts) ← current
-7. Celery + Redis async jobs
+6. Frontend dashboard (React + WebSocket alerts) ← done, incl. backend
+   /api/v1/traffic/* (real ClickHouse queries) and WS /api/v1/ws/alerts
+7. Celery + Redis async jobs ← current
 
 ## Hard rules (never break these)
 - No untested rule ever reaches the live firewall
