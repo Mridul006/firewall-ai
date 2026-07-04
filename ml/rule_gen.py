@@ -47,8 +47,44 @@ def _load_prompt_template() -> str:
     return PROMPT_TEMPLATE_PATH.read_text(encoding="utf-8")
 
 
+def _find_json_object(text: str) -> str | None:
+    """Locate the first balanced {...} JSON object substring in free-form text.
+
+    Some models narrate around the JSON instead of fencing it — e.g. llama3.1
+    returning "Here is the required output:\\n\\n{...}\\n\\nThis rule uses..."
+    with no code fence at all. Brace-counting (ignoring braces inside string
+    literals) finds the object regardless of what surrounds it.
+    """
+    start = text.find("{")
+    if start == -1:
+        return None
+
+    depth = 0
+    in_string = False
+    escape = False
+    for i, char in enumerate(text[start:], start):
+        if escape:
+            escape = False
+            continue
+        if char == "\\":
+            escape = True
+            continue
+        if char == '"':
+            in_string = not in_string
+            continue
+        if in_string:
+            continue
+        if char == "{":
+            depth += 1
+        elif char == "}":
+            depth -= 1
+            if depth == 0:
+                return text[start : i + 1]
+    return None
+
+
 def _extract_json(raw_response: str) -> dict[str, Any]:
-    """Parse the LLM's JSON response, tolerating a surrounding markdown code fence."""
+    """Parse the LLM's JSON response, tolerating a markdown code fence or surrounding prose."""
     text = raw_response.strip()
     fence_match = re.search(r"```(?:json)?\s*(.*?)\s*```", text, re.DOTALL)
     if fence_match:
@@ -57,7 +93,16 @@ def _extract_json(raw_response: str) -> dict[str, Any]:
     try:
         return json.loads(text)
     except json.JSONDecodeError as e:
-        raise RuleGenerationError(f"LLM response was not valid JSON: {e}") from e
+        first_error = e
+
+    json_candidate = _find_json_object(text)
+    if json_candidate is not None:
+        try:
+            return json.loads(json_candidate)
+        except json.JSONDecodeError:
+            pass
+
+    raise RuleGenerationError(f"LLM response was not valid JSON: {first_error}")
 
 
 def generate_rule(

@@ -163,3 +163,107 @@ Update this file whenever a significant decision is made.
 **Decision:** `sandbox/tester.py` distinguishes `InvalidRuleError` (the candidate rule itself doesn't load into iptables) from `SandboxTestError` (the sandbox's own container/image/veth setup failed). The former results in a clean `REJECTED` status with the parse error as the reason; the latter propagates uncaught, leaving the rule stuck in `SANDBOX_TESTING` for an operator to investigate.
 **Reason:** Discovered via a real end-to-end run: a locally-generated (mistral/Ollama) candidate rule used `--dport 20-24` (hyphen), which is invalid iptables syntax — iptables port ranges require a colon (`20:24`). This is exactly the "syntax valid — rule parses without error" item on firewall_rules.md's validation checklist, and a rule failing that check must be rejected like any other failed test, not conflated with an environment problem. The original design treated all sandbox exceptions the same way, which would have left a badly-generated rule stuck in limbo indefinitely instead of cleanly rejected.
 **Revisit when:** Never expected — this distinction (rule-content failure vs. infra failure) is the correct permanent model.
+
+---
+
+## ADR-024 — Two extra hooks beyond the requested list: useDashboardStats, useWebSocket
+**Decision:** `frontend/src/hooks/` includes `useDashboardStats.js` and `useWebSocket.js` in addition to the three originally specified (`useRules`, `useTraffic`, `useAuth`).
+**Reason:** coding_rules.md requires "custom hooks for all data fetching" (unconditional) and separately "WebSocket connection managed in a single useWebSocket hook" (explicit). Dashboard.jsx needs `/api/v1/dashboard/stats` data and AlertBanner.jsx needs the WebSocket alert stream — fetching either inline in a component would violate those rules. Both hooks follow the exact same shape (`{ data, loading, error, refetch }`) as `useRules`/`useTraffic` for consistency.
+**Revisit when:** Never expected — this is filling a gap in the original spec against an explicit existing rule, not scope creep.
+
+---
+
+## ADR-025 — JWT in localStorage (not React state/context only)
+**Decision:** `frontend/src/api.js` stores the JWT in `localStorage`, read fresh on each request via an axios request interceptor.
+**Reason:** The brief allowed either approach depending on runtime: React state/context only for an artifact-style sandboxed environment, or localStorage for a standalone Vite app "running in the browser normally." This is unambiguously the latter — a real `npm create vite` project with its own `package.json`/`vite.config.js`, run via `npm run dev` on port 5173, not an Artifact. Storing the token in React state alone would lose the session on every page refresh, which is poor UX for a dashboard an analyst keeps open. localStorage is vulnerable to XSS-based token theft; a production deployment should prefer an httpOnly cookie set by the backend instead — noted as a comment in `api.js`.
+**Revisit when:** Before any real production deployment — swap for httpOnly cookie-based sessions set by the backend.
+
+---
+
+## ADR-026 — createElement instead of JSX in useAuth.js
+**Decision:** `AuthProvider` in `useAuth.js` builds its returned element with `React.createElement(AuthContext.Provider, { value }, children)` instead of `<AuthContext.Provider value={value}>{children}</AuthContext.Provider>` JSX syntax.
+**Reason:** This project's Vite version (8.x) uses the newer rolldown-based build engine, which — unlike the classic esbuild+Babel `@vitejs/plugin-react` pipeline — refuses to parse JSX syntax in a `.js` file (`npm run build` failed with "Unexpected JSX expression... JSX syntax is disabled"). coding_rules.md's "Hook files: useCamelCase.js" convention means renaming to `.jsx` isn't the right fix; avoiding JSX syntax in the one file that needs a Provider component satisfies both the naming rule and the build. Found by actually running `npm run build`, not by inspecting the toolchain docs.
+**Revisit when:** If a future Vite/plugin upgrade parses JSX in `.js` files again, this could be simplified back to JSX — low priority, `createElement` works fine indefinitely.
+
+---
+
+## ADR-027 — Tailwind CSS v4 via `@tailwindcss/vite`
+**Decision:** The frontend uses Tailwind v4 with the `@tailwindcss/vite` plugin (a single `@import "tailwindcss";` in `index.css`), not the v3 `tailwind.config.js` + PostCSS setup.
+**Reason:** Fewer config files, less surface for PostCSS misconfiguration, and v4 is the current stable major as of this build. coding_rules.md mandates Tailwind for all styling but doesn't pin a version.
+**Revisit when:** Never expected unless a future Tailwind v5 changes the recommended Vite integration.
+
+---
+
+## ADR-028 — Frontend has no WebSocket backend to connect to yet
+**Decision:** `useWebSocket.js` is written against the documented `/api/v1/ws/alerts` contract (layer1_design.md) and degrades gracefully (shows "disconnected," retries on a 5s timer) rather than crashing when the connection fails.
+**Reason:** The FastAPI backend has no WebSocket route implemented anywhere (confirmed via `grep -rn "websocket" backend/` — zero matches) — only the four REST routers (auth, rules, traffic, dashboard) exist. `layer1_design.md` documents the endpoint but it was never built in the backend skeleton phase. This is a pre-existing gap from an earlier build, not something introduced now; building the actual backend WS endpoint is out of scope for the frontend task and is a natural candidate for the Celery/Redis phase (build order step 7) or a dedicated follow-up.
+**Revisit when:** When a backend WebSocket endpoint is actually built — verify `useWebSocket.js`'s message shape assumption (`JSON.parse(event.data)`) against whatever the real endpoint emits.
+**Status: CLOSED** — see ADR-029 through ADR-033. `/api/v1/ws/alerts` now exists and the message shape (`{type, message, ...}`) matches what `useWebSocket.js` already expected.
+
+---
+
+## ADR-029 — Sync clickhouse-driver in FastAPI via run_in_threadpool, not async
+**Decision:** `backend/core/clickhouse.py`, `routes/traffic.py`, `routes/dashboard.py`, and `routes/websocket.py` all wrap their `clickhouse-driver` calls in `starlette.concurrency.run_in_threadpool` rather than calling them directly in an `async def` route.
+**Reason:** `clickhouse-driver` has no async client (unlike `psycopg` for Postgres). coding_rules.md's "never block the event loop with synchronous I/O" rule means a raw synchronous call inside an `async def` route would stall every other concurrent request for the query's duration. `run_in_threadpool` is FastAPI/Starlette's standard idiom for this exact situation — same pattern already used for `psycopg`'s sync mode in `sandbox/promoter.py` and `ml/`'s scripts, which don't run inside an event loop at all and so don't need it, but the backend does.
+**Revisit when:** If ClickHouse query volume ever becomes high enough that threadpool contention matters — consider `aiochclient` or similar, an async ClickHouse client.
+
+---
+
+## ADR-030 — ANOMALY_ALERT_THRESHOLD is separate from ANOMALY_CONTAMINATION
+**Decision:** A new env var `ANOMALY_ALERT_THRESHOLD` (default `0.5`) decides which ClickHouse rows count as "anomalous" for `/api/v1/traffic/anomalies`, the dashboard's `anomalies_24h` count, and the WebSocket anomaly alerts — not `ANOMALY_CONTAMINATION`.
+**Reason:** They're different kinds of numbers entirely. `ANOMALY_CONTAMINATION` (`0.01`) is `ml/anomaly.py`'s IsolationForest training hyperparameter — the *expected fraction* of traffic that's anomalous, used to fit the model. `ANOMALY_ALERT_THRESHOLD` is a *score cutoff* (0.0–1.0 scale) applied to the already-computed `anomaly_score` column. Reusing the contamination value as a score threshold would have been a type/unit mismatch that happened to not crash (both are small floats) but would be semantically wrong. `0.5` matches the convention already established by `ml/anomaly.py`'s `detect_anomalies()` default and `sandbox/fp_scorer.py`'s `ANOMALY_SCORE_THRESHOLD`.
+**Revisit when:** If per-deployment tuning of the alert threshold becomes a product feature (e.g. an analyst-configurable slider in the dashboard) rather than an env var.
+
+---
+
+## ADR-031 — Cross-process alerts via DB/ClickHouse polling, not pub/sub
+**Decision:** `backend/routes/websocket.py`'s `poll_and_broadcast_alerts()` background task polls Postgres (`candidate_rules.updated_at`) and ClickHouse (`traffic_events`) every 3 seconds and broadcasts alerts for anything new, rather than using a push-based mechanism.
+**Reason:** The processes that actually change this data — `sandbox/promoter.py` (sets APPROVED_PENDING/REJECTED after a sandbox test) and the ML/ingestion pipeline — run as separate OS processes with no in-memory link to this FastAPI process's WebSocket connections. Options considered: Postgres `LISTEN`/`NOTIFY` (real push, but requires modifying `sandbox/promoter.py` too, and adds async-`LISTEN` complexity); Redis pub/sub (Redis is already provisioned but Celery/Redis integration is explicitly build order phase 7, still future work — "do not build features not in the current build order phase"). Polling every 3s is simple, requires touching only `backend/`, and a few seconds of latency is a non-issue for a human-in-the-loop security dashboard.
+**Revisit when:** Build order phase 7 (Celery + Redis) lands — Redis pub/sub would be strictly better (instant, no poll overhead) and should replace this.
+
+---
+
+## ADR-032 — WebSocket alert endpoint is unauthenticated (MVP)
+**Decision:** `WS /api/v1/ws/alerts` accepts any connection with no JWT check, unlike every REST route.
+**Reason:** Browsers' native `WebSocket` API doesn't support custom headers, so passing a JWT would require either a query-string token (leaks into server logs/proxies) or a cookie-based auth scheme — neither of which the frontend (`useWebSocket.js`, built in the previous session) was written to do. Alert content today is low-sensitivity (rule IDs, statuses, IPs already visible to any authenticated dashboard user). Fixing this properly means touching the already-built frontend's `useWebSocket.js` too, beyond this task's backend-focused scope.
+**Revisit when:** Before any real deployment — add query-token or cookie-based WS auth, whichever the eventual session model uses.
+
+---
+
+## ADR-033 — AlertBanner moved from Dashboard-only to the persistent Layout
+**Decision:** `<AlertBanner />` now renders in `App.jsx`'s `Layout` (alongside `NavBar`, wrapping every protected page), not inside `Dashboard.jsx` alone.
+**Reason:** Found by actually testing the full flow, not by inspecting the code: approving a rule while on the Rules page, then navigating to Dashboard, showed no alert — because `AlertBanner` (and its WebSocket connection) only existed while `Dashboard` was mounted. Navigating away closed the socket; navigating back opened a new one *after* the alert had already been broadcast to the old (by-then-closed) connection, so it was silently missed. There is no message replay/queue for a client that wasn't connected at broadcast time. Moving it to the persistent `Layout` keeps one WebSocket connection alive for the analyst's whole session regardless of which page they're on.
+**Revisit when:** Never expected — this is the correct permanent placement for a real-time, session-wide alert stream.
+
+---
+
+## ADR-034 — Timezone convention: store UTC everywhere, convert to local only at display time
+**Decision:** Every timestamp is stored and passed between services as UTC — ClickHouse's `traffic_events.timestamp`, Postgres's `TIMESTAMPTZ` columns, every Python `datetime` written by `ingestion/`, `ml/`, `sandbox/`, and `backend/`. The **only** place a timestamp is ever converted to a human's local timezone is the last possible moment: the browser, via `new Date(isoString).toLocaleTimeString()` in `TrafficChart.jsx`. No service in between ever converts to or reasons about a local timezone.
+**Reason:** Found via a real user-reported bug, not a hypothetical. The Dashboard's traffic chart showed timestamps roughly 5.5 hours behind the real time in India (IST, UTC+5:30) — e.g. showing ~1:27–2:17 PM when it was actually ~7:58 PM IST. Root-caused layer by layer:
+- **ClickHouse (storage):** correct. `SHOW timezone` / `SELECT now()` confirmed the container's session timezone is `UTC`, and every write path (`ingestion/zeek_parser.py`'s `datetime.fromtimestamp(ts, tz=timezone.utc)`, and every seed script's `datetime.now(timezone.utc)`) already wrote genuine UTC instants. Not the bug.
+- **Backend (serialization) — this was the actual bug:** `clickhouse-driver` returns **naive** Python `datetime` objects for ClickHouse `DateTime` columns (the column type itself carries no timezone metadata). `backend/routes/traffic.py` passed these naive values straight into the `TrafficEvent` Pydantic model, which serializes a naive datetime to JSON *without* a `Z`/offset suffix (e.g. `"2026-07-04T14:37:49"`, not `"...Z"`). The value was correct UTC; the JSON just never said so.
+- **Frontend (display):** also correct, once given correct input. `new Date(str).toLocaleTimeString()` *is* the right pattern — it converts a properly-tagged instant to the browser's local wall-clock time. But per the JS/ECMA-262 `Date` parsing rules, a date-time string **without** a timezone designator is parsed as **local** time, not UTC. So the frontend was silently and "correctly" (per spec) misinterpreting an untagged UTC value as if it were already local — which is exactly the ~5.5-hour IST offset observed.
+- **Fix:** added `core/clickhouse.py:to_aware_utc()` — attaches `tzinfo=UTC` to any naive datetime clickhouse-driver returns — and call it on every ClickHouse timestamp before it reaches a Pydantic response model (`routes/traffic.py`) or a WebSocket message (`routes/websocket.py`, which already had its own copy of this exact function for a different reason — bookkeeping comparisons — and now shares the one in `core/clickhouse.py` instead of duplicating it). Pydantic then correctly serializes with a `Z` suffix, and the existing frontend code works unmodified.
+**Revisit when:** Layer 4 (east-west insider threat monitoring, build order phase 2 in `docs/PROJECT.md`) is timestamp-heavy by nature — behavioral baselines, access-time-anomaly detection ("3am DB query"), and session correlation all depend on correct, consistent instants. **Any new service that reads a ClickHouse `DateTime` column and hands it to an API response, a WebSocket message, or a log line must call `to_aware_utc()` first** — this is the one recurring gotcha this ADR exists to prevent from being reintroduced ad hoc. If Postgres columns are ever read as naive datetimes too (they haven't been so far — `TIMESTAMPTZ` + psycopg return aware values), the same function applies there as well.
+
+---
+
+## ADR-035 — rule_gen.py's JSON extraction must handle prose-wrapped responses, not just fences
+**Decision:** `ml/rule_gen.py`'s `_extract_json()` now falls back to a brace-counting scan (`_find_json_object()`) that locates the first balanced `{...}` object anywhere in the LLM's raw text, if a direct parse and a markdown-fence-stripped parse both fail.
+**Reason:** Found while re-running the full pipeline with `llama3.1` (previously only tested with `mistral`, which always either returned bare JSON or fenced it). `llama3.1` instead narrated around the JSON with no fence at all — `"Here is the required output:\n\n{...}\n\nThis rule uses iptables syntax..."` — which crashed `generate_rule()` with `RuleGenerationError: LLM response was not valid JSON`, before the rule ever reached the sandbox. This wasn't a sandbox-safety-net case (an invalid *rule*); it was rule_gen.py's own parser being too strict about a formatting convention different local models don't share. Brace-counting (ignoring braces inside string literals) finds the object regardless of what prose surrounds it.
+**Revisit when:** Never expected to need further generalization — this handles the three shapes seen so far (bare JSON, fenced JSON, prose-wrapped JSON) and should generalize to most instruction-following variance across future providers/models.
+
+---
+
+## ADR-036 — llama3.1 is not more reliable than mistral at producing valid iptables commands
+**Decision:** No code change from this entry — recorded as an operational finding. `LLM_PROVIDER=ollama` / `OLLAMA_MODEL=llama3.1` remains the configured default per ADR-017; this is not a recommendation to switch.
+**Reason:** Re-ran the full `rule_gen.py` → `tester.py` → `promoter.py` pipeline against a real ClickHouse anomaly, specifically to check whether switching from `mistral` to the configured-default `llama3.1` (8B) produced syntactically valid `iptables` commands more reliably. It did not. Across 4 completed generations (a 5th crashed on JSON parsing — see ADR-035, fixed and excluded from this count), `llama3.1` produced a genuinely invalid `command` in every case the sandbox got to test: a comma-separated port list passed to `--dport` (needs `-m multiport --dports` instead), and — a distinct, novel failure mode not seen with `mistral` — the `iptables` binary name itself omitted from the `command` string twice (`"-A INPUT -s ..."` instead of `"iptables -A INPUT -s ..."`), which `sh -c` rejects outright as `Illegal option -A`. One generation appeared to "pass," but only because ClickHouse had no traffic left in `tester.py`'s 10-minute replay window at that moment — re-run with fresh traffic, the same missing-binary-name defect was caught and correctly rejected. Every invalid rule was correctly caught by the sandbox and never reached `LIVE` — the core guarantee held throughout.
+**Revisit when:** Evaluating whether any local model is reliable enough to skip the sandbox's syntax check (unlikely to ever be a good idea) — or when comparing against Claude/OpenAI's reliability on this same task, which hasn't been tested yet.
+
+---
+
+## ADR-037 — Current status: rule generation is safety-verified, not yet demonstrated working end-to-end
+**Decision:** No code change — this is a status marker for whoever picks up Layer 1 next. Treat rule generation as **"safety-verified but not yet demonstrated working end-to-end with a passing rule."**
+**Reason:** Both local, CPU-only Ollama models tried so far — `mistral` (ADR from the sandbox-build session) and `llama3.1` (ADR-036) — fail to reliably produce syntactically valid `iptables` commands. Every invalid attempt has been correctly caught and rejected by the sandbox (`tester.py`'s `InvalidRuleError` → `REJECTED` path), so the core guarantee ("no untested rule ever reaches the live firewall") has held in every real run. What hasn't happened yet, in any run to date, is the actual **happy path**: a generated rule that is syntactically valid, gets genuinely replayed against real traffic by the sandbox, passes the FP-rate check, and reaches `APPROVED_PENDING` on its own merits (as opposed to a hollow pass caused by an empty replay window, which doesn't count — see ADR-036). The pipeline's plumbing (rule_gen → tester → fp_scorer → promoter → Postgres → frontend) is fully verified working; the LLM's ability to reliably produce a *good* rule is not.
+**Next step:** When ready to spend API budget, test with the `claude` or `openai` provider (already built and swappable via `LLM_PROVIDER` per ADR-017 — no code change needed, just the env var and a real API key) on this same real-anomaly pipeline. That determines whether this is a **local-model capability ceiling** (small CPU-bound models struggling with precise `iptables` syntax) or a **deeper issue** (e.g. a prompt template gap, a `rule_gen.py`/sandbox bug not yet surfaced, or a fundamental limit of LLM-generated firewall rules generally). Until that test happens, don't assume a hosted-model swap is a fix, and don't report Layer 1's rule generation as "working" beyond the safety net.
+**Revisit when:** Immediately upon running the Claude/OpenAI comparison test — update this entry (or superseding it with a new ADR) with that result either way.
