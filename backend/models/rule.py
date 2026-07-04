@@ -41,7 +41,7 @@ class CandidateRule(Base):
     syntax: Mapped[str] = mapped_column(String(20), nullable=False)
     command: Mapped[str] = mapped_column(Text, nullable=False)
     description: Mapped[str | None] = mapped_column(Text, nullable=True)
-    mitre_technique: Mapped[str | None] = mapped_column(String(20), nullable=True)
+    mitre_technique: Mapped[str | None] = mapped_column(String(64), nullable=True)
     confidence: Mapped[float | None] = mapped_column(Float, nullable=True)
     fp_rate: Mapped[float | None] = mapped_column(Float, nullable=True)
     status: Mapped[str] = mapped_column(

@@ -5,7 +5,8 @@ Firewall AI — an autonomous cybersecurity platform with 5 defense layers that 
 
 ## Current focus
 Building Layer 1 MVP — AI-driven sandboxed firewall rule generation engine.
-Backend skeleton, data ingestion pipeline, and ML core are built; next up is sandbox testing.
+Backend skeleton, data ingestion pipeline, ML core, and sandbox testing are built;
+next up is the frontend dashboard.
 
 ## Repo structure
 ```
@@ -38,8 +39,8 @@ firewall-ai/
 2. FastAPI backend skeleton ← done
 3. Data ingestion (Zeek → Kafka → ClickHouse) ← done
 4. ML core (Isolation Forest + swappable LLM rule gen) ← done
-5. Sandbox testing (Docker + tcpreplay + FP scorer, incl. firewall syntax validation) ← current
-6. Frontend dashboard (React + WebSocket alerts)
+5. Sandbox testing (Docker + tcpreplay + FP scorer, incl. firewall syntax validation) ← done
+6. Frontend dashboard (React + WebSocket alerts) ← current
 7. Celery + Redis async jobs
 
 ## Hard rules (never break these)

@@ -70,13 +70,13 @@ TTL timestamp + INTERVAL 30 DAY;
 ### candidate_rules (PostgreSQL)
 ```sql
 CREATE TABLE candidate_rules (
-    id              UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    id              UUID PRIMARY KEY,   -- generated app-side (uuid.uuid4), not a DB default — see ADR-019
     created_at      TIMESTAMPTZ DEFAULT NOW(),
     updated_at      TIMESTAMPTZ DEFAULT NOW(),
     syntax          VARCHAR(20),        -- 'iptables' or 'pf'
     command         TEXT NOT NULL,
     description     TEXT,
-    mitre_technique VARCHAR(20),
+    mitre_technique VARCHAR(64),        -- e.g. "T1046 Network Service Discovery" — code + name, per rule_gen.txt
     confidence      FLOAT,
     fp_rate         FLOAT,
     status          VARCHAR(30),        -- PENDING, SANDBOX_TESTING, REJECTED, APPROVED_PENDING, LIVE, REVOKED
@@ -182,16 +182,41 @@ file is rendered with `str.format()` — see ADR-018.
 
 ## Sandbox design
 
-The sandbox is a Docker container with:
-- An isolated network namespace (no access to real network)
-- A virtual interface pair (veth) for traffic injection
-- iptables pre-loaded with the candidate rule
-- tcpreplay to inject the last 10 minutes of captured real traffic
+Implemented in `sandbox/` (Dockerfile, tester.py, fp_scorer.py, promoter.py):
+
+```
+sandbox/Dockerfile    — Ubuntu image with iptables + tcpreplay + iproute2 pre-installed
+sandbox/tester.py     — orchestrates: fetch traffic, replay per flow, collect results
+sandbox/fp_scorer.py  — FP rate = blocked non-anomalous packets / total non-anomalous packets
+sandbox/promoter.py   — PostgreSQL: PENDING -> SANDBOX_TESTING -> APPROVED_PENDING or REJECTED
+```
+
+The sandbox container runs with `--network none` (no access to the real network) and
+`--cap-add=NET_ADMIN --cap-add=NET_RAW`. Each traffic flow from ClickHouse's
+`traffic_events` is replayed **independently** against the loaded candidate rule:
+
+1. Reconstruct that flow's packets with scapy (traffic_events stores flow summaries,
+   not raw captures — see ADR-021), capped at 50 packets / 2 seconds per flow so total
+   runtime stays bounded.
+2. Alias the flow's destination IP as a `/32` onto a **veth pair's peer interface**
+   (`veth-in`), then `tcpreplay` injects onto the other end (`veth-out`).
+3. Zero the INPUT chain counters, replay, then read `iptables -L INPUT -v -n -x` for
+   any DROP/REJECT rule with a nonzero packet count → that flow was blocked.
+
+The veth pair (not `lo`, not a `dummy` interface) is required — see ADR-020 for why
+both alternatives silently fail to reach netfilter at all. Destination MAC must be
+broadcast (`ff:ff:ff:ff:ff:ff`) or the receiving interface drops the frame at L2.
+
+A candidate rule that fails to even load into iptables (invalid syntax) is a rejected
+verdict, same as a rule that blocks too much legitimate traffic — not an infrastructure
+failure. See ADR-023.
 
 FP scorer measures:
 ```
 FP rate = packets blocked by rule that are NOT anomalous / total non-anomalous packets
 ```
+"Anomalous" is decided by each flow's stored `anomaly_score` exceeding 0.5 (matching
+`ml/anomaly.py`'s `detect_anomalies()` default threshold).
 
 Threshold: FP rate > 5% → reject rule.
 Configurable via SANDBOX_FP_THRESHOLD env var.

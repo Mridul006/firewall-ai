@@ -128,3 +128,38 @@ Update this file whenever a significant decision is made.
 **Decision:** The literal JSON schema block in `knowledge/prompts/rule_gen.txt` uses doubled braces (`{{ }}`) around the example object, while the actual substitution placeholders (`{traffic_summary}`, `{anomaly_score}`, etc.) stay single-braced.
 **Reason:** `rule_gen.py` loads this file and renders it with `str.format()`, per the coding_rules convention for prompt templates. `str.format()` treats every `{...}` as a substitution field, so the unescaped example JSON in the prompt raised `KeyError` on the first real run. Discovered by actually executing the rule generation flow against a local Ollama model, not just by reading the code.
 **Revisit when:** If the templating mechanism ever changes away from `str.format()` (e.g. to Jinja2), remove the brace-doubling — it's specific to this substitution method.
+
+---
+
+## ADR-019 — candidate_rules.id is generated app-side, not a DB default
+**Decision:** `sandbox/promoter.py` generates `id = uuid.uuid4()` in Python and passes it explicitly on INSERT, rather than relying on a database default.
+**Reason:** `layer1_design.md`'s schema sketch shows `id UUID PRIMARY KEY DEFAULT gen_random_uuid()`, but `backend/models/rule.py`'s SQLAlchemy column only ever set a Python-side `default=uuid.uuid4` — never a `server_default`. The live table (created via SQLAlchemy's `create_all`) genuinely has no DB-level default, confirmed via `\d candidate_rules`. Matching that in `promoter.py` avoids a NOT NULL violation on insert; the design doc has been corrected to describe reality instead of the original intent.
+**Revisit when:** If a real Alembic migration is introduced (build order still has no migration tooling) — add a proper `server_default=text("gen_random_uuid()")` then, and this app-side workaround can be dropped.
+
+---
+
+## ADR-020 — veth pair (not lo, not dummy) for tcpreplay packet injection
+**Decision:** The sandbox container creates its own veth pair (`veth-out`/`veth-in`) inside its own network namespace. `tcpreplay` injects onto `veth-out`; the candidate flow's destination IP is aliased as a `/32` onto `veth-in` so the kernel treats replayed packets as locally destined, which is what actually makes them traverse the iptables INPUT chain.
+**Reason:** Empirically tested three approaches before finding one that works. `lo` (the obvious first choice, and what an earlier draft of this design assumed): tcpreplay warns "Unsupported physical layer type 0x0304 on lo" and packets never reached netfilter (0 iptables hits) despite tcpreplay reporting successful sends — a documented tcpreplay/loopback limitation. `dummy0`: packets sent to a dummy interface are transmitted-and-discarded by design (that's what a dummy interface is for) — they never loop back to the receive path, so iptables INPUT never saw them either. A veth pair is a genuine point-to-point link — whatever exits one end is received on the other — which is exactly what let a real DROP rule's packet counter increment. A broadcast destination MAC (`ff:ff:ff:ff:ff:ff`) is also required, or the peer interface silently drops frames not addressed to its own MAC. Confirmed via a live smoke test with real containers before touching tester.py's production code.
+**Revisit when:** Never expected for the MVP's single-flow replay model — this is a standard, well-established technique for isolated firewall-rule testing.
+
+---
+
+## ADR-021 — Synthetic per-flow pcaps (scapy), not raw packet capture
+**Decision:** `sandbox/tester.py` reconstructs Ethernet-framed packets from each `traffic_events` row's flow summary (src/dst IP and port, protocol, byte/packet counts, duration) using `scapy`, rather than replaying an original packet capture.
+**Reason:** `traffic_events` stores Zeek conn-log-derived flow summaries (bytes, packets, duration), not raw packets — the ingestion pipeline (ADR from the ingestion build) never stored pcap data, so there is no original capture to replay. Packet count is capped at 50 and total replay duration at 2 seconds per flow to bound sandbox runtime; packets are evenly spaced across that window so simple single-flow rate-limit rules (`-m limit`) are still meaningfully exercised, even though cross-flow timing/interleaving isn't reproduced.
+**Revisit when:** If ingestion starts storing genuine pcap captures (not just Zeek logs) — replay those directly instead of reconstructing. Also see layer1_design.md's MVP-vs-future table: "extended simulation with adversarial traffic" is already flagged as future work, consistent with this being an MVP-scoped approximation.
+
+---
+
+## ADR-022 — mitre_technique widened from VARCHAR(20) to VARCHAR(64)
+**Decision:** `candidate_rules.mitre_technique` is `VARCHAR(64)`, both in the live table (via `ALTER TABLE`) and in `backend/models/rule.py`.
+**Reason:** `knowledge/prompts/rule_gen.txt` instructs the LLM to return the full "T-number and name" (e.g. `"T1046 Network Service Discovery"`, 32 characters) — but the schema only allowed 20, so the very first real end-to-end insert failed with `StringDataRightTruncation`. Widening preserves the analyst-facing technique name (firewall_rules.md's validation checklist requires rules be "Tagged" with the MITRE ID) rather than truncating it or changing the prompt to ask for a bare code.
+**Revisit when:** Never expected — 64 chars comfortably fits any current MITRE ATT&CK technique name.
+
+---
+
+## ADR-023 — Invalid rule syntax is a REJECTED verdict, not a sandbox infra failure
+**Decision:** `sandbox/tester.py` distinguishes `InvalidRuleError` (the candidate rule itself doesn't load into iptables) from `SandboxTestError` (the sandbox's own container/image/veth setup failed). The former results in a clean `REJECTED` status with the parse error as the reason; the latter propagates uncaught, leaving the rule stuck in `SANDBOX_TESTING` for an operator to investigate.
+**Reason:** Discovered via a real end-to-end run: a locally-generated (mistral/Ollama) candidate rule used `--dport 20-24` (hyphen), which is invalid iptables syntax — iptables port ranges require a colon (`20:24`). This is exactly the "syntax valid — rule parses without error" item on firewall_rules.md's validation checklist, and a rule failing that check must be rejected like any other failed test, not conflated with an environment problem. The original design treated all sandbox exceptions the same way, which would have left a badly-generated rule stuck in limbo indefinitely instead of cleanly rejected.
+**Revisit when:** Never expected — this distinction (rule-content failure vs. infra failure) is the correct permanent model.
