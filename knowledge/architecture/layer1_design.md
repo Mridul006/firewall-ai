@@ -67,6 +67,17 @@ ORDER BY (timestamp, src_ip)
 TTL timestamp + INTERVAL 30 DAY;
 ```
 
+**Timezone convention (see ADR-034 in decisions.md): `timestamp` is always UTC.** ClickHouse's
+`DateTime` column carries no timezone metadata, and `clickhouse-driver` returns it as a
+**naive** Python `datetime` — every writer must put a genuine UTC instant in it
+(`datetime.now(timezone.utc)` / `datetime.fromtimestamp(ts, tz=timezone.utc)`), and every
+reader that hands it to an API response or WebSocket message must call
+`backend/core/clickhouse.py`'s `to_aware_utc()` first, or the value silently loses its
+timezone tag in JSON and gets misinterpreted as local time by the browser. Local-time
+conversion happens in exactly one place: the browser, at final display
+(`TrafficChart.jsx`'s `toLocaleTimeString()`). No service in between ever converts to or
+reasons about a local timezone.
+
 ### candidate_rules (PostgreSQL)
 ```sql
 CREATE TABLE candidate_rules (
@@ -109,11 +120,30 @@ GET    /api/v1/rules/{id}          — get single rule with full details
 POST   /api/v1/rules/{id}/approve  — human approves pending rule (HITL)
 POST   /api/v1/rules/{id}/reject   — human rejects pending rule
 POST   /api/v1/rules/{id}/revoke   — revoke a live rule
-GET    /api/v1/traffic/            — recent traffic events with anomaly scores
-GET    /api/v1/traffic/anomalies   — only anomalous events above threshold
-GET    /api/v1/dashboard/stats     — summary stats for dashboard
-WS     /api/v1/ws/alerts           — WebSocket for real-time alerts
+GET    /api/v1/traffic/            — recent traffic events with anomaly scores (?minutes=, default 60)
+GET    /api/v1/traffic/anomalies   — only events with anomaly_score > ANOMALY_ALERT_THRESHOLD
+GET    /api/v1/dashboard/stats     — summary stats for dashboard (rule counts + real ClickHouse 24h counts)
+WS     /api/v1/ws/alerts           — real-time alerts: rule status changes + high-severity anomalies
 ```
+
+`GET /api/v1/traffic/` and `/anomalies` are backed by real ClickHouse queries
+(`backend/core/clickhouse.py` + `routes/traffic.py`), run via `run_in_threadpool` since
+`clickhouse-driver` has no async client (ADR-029). `/api/v1/dashboard/stats` now also
+queries ClickHouse for `traffic_events_24h`/`anomalies_24h` instead of hardcoded zeros.
+Every timestamp these return is passed through `to_aware_utc()` before serialization —
+see the timezone convention note under `traffic_events`'s schema above and ADR-034.
+
+`WS /api/v1/ws/alerts` (`backend/routes/websocket.py`) is unauthenticated (ADR-032) and
+broadcasts two alert types to every connected client:
+- `{"type": "rule_status_change", "message": "Rule <id> is now <STATUS>", ...}` — for any
+  `candidate_rules` status transition, especially APPROVED_PENDING and LIVE
+- `{"type": "anomaly", "message": "High-severity anomaly from <src> to <dst> (score X)", ...}`
+  — for new `traffic_events` rows above `ANOMALY_ALERT_THRESHOLD`
+
+Both are detected by a background task polling Postgres and ClickHouse every 3 seconds
+(ADR-031) — not a push mechanism — because the processes that actually cause these
+changes (`sandbox/promoter.py`, the ML/ingestion pipeline) run as separate OS processes
+with no in-memory link to this FastAPI process's WebSocket connections.
 
 ---
 
@@ -220,6 +250,41 @@ FP rate = packets blocked by rule that are NOT anomalous / total non-anomalous p
 
 Threshold: FP rate > 5% → reject rule.
 Configurable via SANDBOX_FP_THRESHOLD env var.
+
+---
+
+## Frontend dashboard
+
+Implemented in `frontend/` (React + Vite + Tailwind v4 + Recharts + react-router-dom):
+
+```
+src/api.js                      — central axios client; JWT interceptor, 401 -> logout
+src/hooks/useAuth.js            — AuthContext/AuthProvider, login/logout, current user
+src/hooks/useRules.js           — fetch + filter rules by status, approve/reject actions
+src/hooks/useTraffic.js         — fetch traffic events / anomalies
+src/hooks/useDashboardStats.js  — fetch dashboard stats (added — see ADR-024)
+src/hooks/useWebSocket.js       — manage the alert WebSocket connection (added — ADR-024)
+src/components/                 — RuleCard, RuleList, TrafficChart, AlertBanner, StatCards
+src/pages/                      — Login, Dashboard, Rules, Traffic
+```
+
+This is a human-in-the-loop review UI for a security analyst: the Rules page has
+PENDING/APPROVED_PENDING/LIVE/REJECTED tabs, and Approve/Reject buttons on a RuleCard
+only render when `status === 'APPROVED_PENDING'` — matching the HITL hard rule (AI
+suggests, human approves) exactly.
+
+The JWT lives in `localStorage` (see ADR-025) since this is a standalone Vite app, not
+a sandboxed artifact. Protected routes redirect to `/login` when unauthenticated.
+`<AlertBanner />` renders in the persistent `Layout` (not inside `Dashboard`) so its
+WebSocket connection survives navigation between pages — see ADR-033.
+
+Verified end-to-end with a real backend and real Postgres/ClickHouse data (not just
+`npm run build` succeeding): logged in, saw real stat-card numbers, the Traffic page
+rendering a real chart, `AlertBanner` showing "connected," clicked a real Approve
+button, confirmed the rule moved from APPROVED_PENDING to LIVE in Postgres, and watched
+the resulting WebSocket alert appear live in the banner regardless of which page was
+open at the time. The traffic/WebSocket gaps flagged in the previous version of this doc
+are closed — see the API endpoints section above and ADR-029 through ADR-033.
 
 ---
 
