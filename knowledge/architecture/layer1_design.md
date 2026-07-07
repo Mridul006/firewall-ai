@@ -44,6 +44,14 @@ FP scorer (measures: legitimate traffic blocked / total legitimate traffic)
                            status: LIVE → push to firewall via iptables/pf API
 ```
 
+**No continuous ingestion pipeline runs yet** (Zeek/Suricata → Kafka → ClickHouse is
+built but not deployed as a long-running service — Celery + Redis async jobs is next in
+the build order, not this). Every row in `traffic_events` so far has come from manual or
+scripted seeding. For demo purposes, use `scripts/seed_demo_data.py` — it inserts
+realistic traffic with current timestamps in one command, so the dashboard's default
+60-minute view shows data immediately without asking for help each time. See
+`scripts/README.md` and ADR-041.
+
 ---
 
 ## Database schemas
@@ -293,13 +301,23 @@ traffic instead comes from real socket connections made from inside the containe
 
 1. Alias the flow's `dst_ip` onto the container's interface (`ip addr replace`, same
    idempotent pattern host mode already uses).
-2. Zero the `OUTPUT` chain counters.
-3. Run a shell loop attempting `count` real connections via bash's `/dev/tcp` (TCP) or
+2. **Pin the flow's `src_ip` as the actual source address of the generated traffic** —
+   `ip addr replace <src_ip>/32 dev veth-out` plus an explicit
+   `ip route replace local <dst_ip> dev veth-in src <src_ip> table local`. Both are
+   required: aliasing dst_ip alone makes the kernel's auto-generated `local`-table route
+   pick the *destination* address as the source, and a normal `main`-table route with
+   `src` set has no effect since `local` takes priority. Without this, any rule with a
+   `-s <this-host-ip>` clause — a completely natural thing for an LLM to write — silently
+   never matched, and blocked 0 anomalous packets while still reporting a passing 0.0
+   fp_rate. Found via a real production-pipeline run, fixed and re-verified with the same
+   rule. See ADR-042.
+3. Zero the `OUTPUT` chain counters.
+4. Run a shell loop attempting `count` real connections via bash's `/dev/tcp` (TCP) or
    `/dev/udp` (UDP) — each individual attempt wrapped in `timeout 2s`. This is required,
    not cosmetic: a `DROP`ped SYN produces no RST, so an unbounded connect() blocks on the
    kernel's own SYN-retry timeout — this hung an early test run for 27+ minutes on a
    single flow before the per-attempt timeout was added. See ADR-040.
-4. Read `OUTPUT`'s counters back — same DROP/REJECT-with-nonzero-packets check as the
+5. Read `OUTPUT`'s counters back — same DROP/REJECT-with-nonzero-packets check as the
    other two modes (`_any_drop_matched`, reused unchanged).
 
 **Known limitation, not hidden**: ICMP flows have no real egress-generation mechanism
@@ -314,9 +332,11 @@ A candidate rule that fails to even load into iptables (invalid syntax) is a rej
 verdict in all three modes, same as a rule that blocks too much legitimate traffic — not
 an infrastructure failure. See ADR-023.
 
-FP scorer measures (identically across all three modes):
+FP scorer measures **two** independent metrics (identically across all three modes) — a
+rule must clear both to pass:
 ```
-FP rate = packets blocked by rule that are NOT anomalous / total non-anomalous packets
+FP rate        = packets blocked by rule that are NOT anomalous / total non-anomalous packets
+Detection rate = anomalous packets the rule actually blocked / total anomalous packets
 ```
 "Anomalous" is decided by each flow's stored `anomaly_score` exceeding 0.5 (matching
 `ml/anomaly.py`'s `detect_anomalies()` default threshold). For router and output mode
@@ -324,8 +344,22 @@ this is exactly "what percentage of legitimate traffic would have been wrongly
 blocked" — the same formula applies unchanged since it only reads `FlowResult.blocked`,
 agnostic to which chain produced that boolean.
 
-Threshold: FP rate > 5% → reject rule.
-Configurable via SANDBOX_FP_THRESHOLD env var.
+Detection rate exists because FP rate alone can't catch a rule that matches nothing at
+all — ADR-042 found exactly this happen for real (a rule reached `APPROVED_PENDING`
+with a perfect 0.0 fp_rate while blocking 0% of its target traffic). See ADR-043.
+
+Thresholds:
+- FP rate > 5% → reject. Configurable via `SANDBOX_FP_THRESHOLD`.
+- Detection rate < 10% → reject. Configurable via `SANDBOX_DETECTION_THRESHOLD`. Kept
+  deliberately low — real `-m recent` rate-limiting rules this project has generated
+  intentionally block well under 100% (37.5% observed) by design, and must not be
+  rejected for that.
+- If there's no anomalous traffic in the replay window at all (it aged out before the
+  test ran), `detection_rate` is `None` and this check is skipped rather than
+  auto-rejecting an untestable rule — mirrors FP rate's own zero-denominator handling.
+
+`sandbox_result["mode"]` (`"host"`, `"router"`, or `"output"`) is recorded for every
+test, so a rule's stored history always shows which mode validated it.
 
 `sandbox_result["mode"]` (`"host"`, `"router"`, or `"output"`) is recorded for every
 test, so a rule's stored history always shows which mode validated it.

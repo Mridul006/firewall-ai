@@ -552,6 +552,13 @@ def _replay_all_flows_router_mode(command: str, traffic: pd.DataFrame) -> list[F
 # locally-originated, so they can only ever hit INPUT or FORWARD — never
 # OUTPUT. Genuine egress traffic instead comes from real socket connections
 # made from inside the container. See ADR-040.
+#
+# The generated packet's *source* address also has to be pinned to the
+# flow's real src_ip, not just its destination — otherwise any rule with a
+# `-s <this-host-ip>` clause (a completely natural thing for an LLM to write)
+# silently never matches. See _replay_and_check_output's docstring and
+# ADR-042 for why this needs both an address alias and an explicit `local`
+# table route override, not just one or the other.
 # ============================================================================
 
 def _build_egress_script(dst_ip: str, dst_port: int, protocol: str, count: int) -> str:
@@ -590,18 +597,38 @@ def _build_egress_script(dst_ip: str, dst_port: int, protocol: str, count: int) 
 
 
 def _replay_and_check_output(
-    container: Container, dst_ip: str, dst_port: int, protocol: str, count: int
+    container: Container, src_ip: str, dst_ip: str, dst_port: int, protocol: str, count: int
 ) -> bool:
-    """Alias dst_ip, generate real outbound connection attempts, and report
-    whether the container's own OUTPUT chain blocked them.
+    """Alias src_ip and dst_ip, generate real outbound connection attempts, and
+    report whether the container's own OUTPUT chain blocked them.
 
-    `ip addr replace` is idempotent, same as host mode's own per-flow setup.
-    Individual connection attempts are expected to fail/refuse/time out —
-    nothing is listening on the other end — that is not a sandbox error,
-    unlike tcpreplay's exit code, which does indicate a real injection
-    failure in the other two modes.
+    Aliasing dst_ip alone (the original ADR-040 design) is not enough to make
+    the generated packet's *source* address match the flow's real src_ip —
+    confirmed empirically (see ADR-042): once dst_ip is aliased as a /32, the
+    kernel treats it as a local-delivery destination and its auto-generated
+    `local` table route always picks the *destination* address as the source
+    too, regardless of what other addresses are configured on the container.
+    A plain `ip route replace <dst>/32 ... src <src_ip>` in the main table has
+    no effect either — the `local` table takes priority and is never
+    consulted. Two things are required together: (1) `src_ip` must be a
+    locally-assigned address (the kernel rejects an unassigned address as an
+    invalid `prefsrc`), and (2) the `local` table's own route for `dst_ip`
+    must be explicitly replaced with one specifying that `src_ip`. Without
+    both, any rule with a `-s <this-host-ip>` clause — which is exactly what
+    an LLM naturally writes for "this host is exfiltrating data" — silently
+    never matches, no matter how correct the rule actually is.
+
+    `ip addr replace` / `ip route replace` are idempotent, same as host
+    mode's own per-flow setup. Individual connection attempts are expected to
+    fail/refuse/time out — nothing is listening on the other end — that is
+    not a sandbox error, unlike tcpreplay's exit code, which does indicate a
+    real injection failure in the other two modes.
     """
     container.exec_run(["ip", "addr", "replace", f"{dst_ip}/32", "dev", PEER_IFACE])
+    container.exec_run(["ip", "addr", "replace", f"{src_ip}/32", "dev", REPLAY_IFACE])
+    container.exec_run(
+        ["ip", "route", "replace", "local", dst_ip, "dev", PEER_IFACE, "src", src_ip, "table", "local"]
+    )
     container.exec_run(["iptables", "-Z", "OUTPUT"])
 
     script = _build_egress_script(dst_ip, dst_port, protocol, count)
@@ -626,6 +653,7 @@ def _replay_all_flows_output_mode(command: str, traffic: pd.DataFrame) -> list[F
                 count = max(1, min(int(flow["packets"]), MAX_PACKETS_PER_FLOW))
                 blocked = _replay_and_check_output(
                     container,
+                    str(flow["src_ip"]),
                     str(flow["dst_ip"]),
                     int(flow["dst_port"]),
                     str(flow["protocol"]).upper(),
@@ -749,12 +777,29 @@ def run_sandbox_test(
 
     if scored["passed"]:
         promoter.approve(rule_id, sandbox_result)
+        detection_str = (
+            "n/a" if scored["detection_rate"] is None else f"{scored['detection_rate']:.4f}"
+        )
         logger.info(
-            f"Rule {rule_id} PASSED sandbox test ({mode} mode, fp_rate={scored['fp_rate']:.4f}) "
+            f"Rule {rule_id} PASSED sandbox test ({mode} mode, fp_rate={scored['fp_rate']:.4f}, "
+            f"detection_rate={detection_str}) "
             f"-> APPROVED_PENDING in {sandbox_result['pipeline_duration_seconds']} s end to end"
         )
     else:
-        reason = f"FP rate {scored['fp_rate']:.4f} exceeds threshold {scored['threshold']:.4f}"
+        # Report every check that actually failed -- a rule can fail on FP
+        # rate, detection rate, or both, and the two are independent
+        # findings (see ADR-043). Reusing a single hardcoded "FP rate
+        # exceeded" message regardless of cause would misreport why a rule
+        # with 0.0 fp_rate but 0% detection was rejected.
+        reasons = []
+        if scored["fp_rate"] > scored["threshold"]:
+            reasons.append(f"FP rate {scored['fp_rate']:.4f} exceeds threshold {scored['threshold']:.4f}")
+        if scored["detection_rate"] is not None and scored["detection_rate"] < scored["detection_threshold"]:
+            reasons.append(
+                f"detection rate {scored['detection_rate']:.4f} below threshold "
+                f"{scored['detection_threshold']:.4f}"
+            )
+        reason = "; ".join(reasons) if reasons else "sandbox test failed"
         promoter.reject(rule_id, sandbox_result, reason)
         logger.info(
             f"Rule {rule_id} REJECTED ({mode} mode) in "

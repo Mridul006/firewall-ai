@@ -13,7 +13,10 @@ now has three testing modes, auto-dispatched by chain: host mode (INPUT), router
 blocking exfiltration/C2 beaconing) — each verified to genuinely block bad traffic and
 pass legitimate traffic, not just load without error. Output mode has one known gap:
 ICMP flows can't be tested (no ping-equivalent tool available under `--network none`).
-Next up is Celery + Redis async jobs.
+Next up is Celery + Redis async jobs. No continuous ingestion pipeline runs yet, so
+traffic_events data goes stale between sessions — run `scripts/seed_demo_data.py`
+before any demo to refresh it with current-timestamp data in one command (see
+scripts/README.md and ADR-041).
 
 ## Repo structure
 ```
@@ -23,6 +26,7 @@ firewall-ai/
 ├── ml/                   ← Isolation Forest + swappable LLM rule gen (Ollama default)
 ├── sandbox/              ← Docker sandbox + tcpreplay + FP scorer
 ├── ingestion/            ← Zeek + Kafka + ClickHouse pipeline
+├── scripts/              ← Standalone ops scripts (e.g. seed_demo_data.py)
 ├── frontend/             ← React + Vite + Tailwind dashboard
 ├── infra/                ← docker-compose for all infrastructure
 ├── knowledge/            ← Research, architecture decisions, playbooks
