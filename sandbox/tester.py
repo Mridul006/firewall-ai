@@ -284,6 +284,24 @@ def _replay_all_flows(command: str, traffic: pd.DataFrame) -> list[FlowResult]:
     return results
 
 
+def _pipeline_duration_seconds(trigger_event: dict[str, Any] | None) -> float | None:
+    """Seconds from anomaly detection to now, if trigger_event carries a detected_at.
+
+    detected_at (set by ml/rule_gen.py's AnomalyContext) marks when the
+    anomaly was picked up for rule generation — earlier than this sandbox
+    test even starts — so this captures LLM latency plus sandbox-test time,
+    the full "time to generate and validate" a rule end to end.
+    """
+    if not trigger_event or "detected_at" not in trigger_event:
+        return None
+    try:
+        detected_at = datetime.fromisoformat(trigger_event["detected_at"])
+    except (TypeError, ValueError) as e:
+        logger.warning(f"Could not parse trigger_event.detected_at for timing: {e}")
+        return None
+    return (datetime.now(timezone.utc) - detected_at).total_seconds()
+
+
 def run_sandbox_test(
     rule: dict[str, Any], trigger_event: dict[str, Any] | None = None
 ) -> dict[str, Any]:
@@ -325,8 +343,13 @@ def run_sandbox_test(
                 "tested_at": datetime.now(timezone.utc).isoformat(),
                 "flows_tested": 0,
                 "error": str(e),
+                "pipeline_duration_seconds": _pipeline_duration_seconds(trigger_event),
             }
             promoter.reject(rule_id, sandbox_result, f"Invalid rule: {e}")
+            logger.info(
+                f"Rule {rule_id} REJECTED (invalid syntax) in "
+                f"{sandbox_result['pipeline_duration_seconds']} s end to end"
+            )
             return {"rule_id": str(rule_id), "passed": False, **sandbox_result}
 
     scored = score_replay(results)
@@ -334,6 +357,7 @@ def run_sandbox_test(
     sandbox_result = {
         "tested_at": datetime.now(timezone.utc).isoformat(),
         "flows_tested": len(results),
+        "pipeline_duration_seconds": _pipeline_duration_seconds(trigger_event),
         **scored,
     }
 
@@ -341,10 +365,14 @@ def run_sandbox_test(
         promoter.approve(rule_id, sandbox_result)
         logger.info(
             f"Rule {rule_id} PASSED sandbox test (fp_rate={scored['fp_rate']:.4f}) "
-            "-> APPROVED_PENDING"
+            f"-> APPROVED_PENDING in {sandbox_result['pipeline_duration_seconds']} s end to end"
         )
     else:
         reason = f"FP rate {scored['fp_rate']:.4f} exceeds threshold {scored['threshold']:.4f}"
         promoter.reject(rule_id, sandbox_result, reason)
+        logger.info(
+            f"Rule {rule_id} REJECTED in "
+            f"{sandbox_result['pipeline_duration_seconds']} s end to end"
+        )
 
     return {"rule_id": str(rule_id), **sandbox_result}

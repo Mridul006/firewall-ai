@@ -32,7 +32,17 @@ class RuleGenerationError(Exception):
 
 @dataclass
 class AnomalyContext:
-    """Summarizes a detected anomaly for the rule generation prompt."""
+    """Summarizes a detected anomaly for the rule generation prompt.
+
+    detected_at is the wall-clock time this anomaly was picked up for rule
+    generation (ISO 8601, UTC) — distinct from first_seen/last_seen, which
+    describe the underlying traffic window. Callers should set it to
+    datetime.now(timezone.utc).isoformat() right before calling
+    generate_rule(). It rides along in trigger_event through to Postgres so
+    sandbox/tester.py can compute "time to generate and validate" —
+    detected_at to APPROVED_PENDING/REJECTED — end to end, including LLM
+    latency, not just the sandbox-test portion.
+    """
 
     traffic_summary: str
     anomaly_score: float
@@ -40,6 +50,7 @@ class AnomalyContext:
     first_seen: str
     last_seen: str
     affected_flows: str
+    detected_at: str
 
 
 def _load_prompt_template() -> str:
