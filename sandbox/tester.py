@@ -1,8 +1,24 @@
 """Orchestrates the full sandbox test for a candidate firewall rule.
 
-Spins up an isolated Docker container (--network none, no route to the real
-network), loads the candidate iptables rule, replays the last N minutes of
-real traffic against it flow by flow, and hands the results to fp_scorer.py.
+Three testing modes, auto-selected by which iptables chain the candidate
+rule targets (see _detect_chain) — never a manual toggle:
+
+- Host mode (INPUT chain): a single isolated container (--network none, no
+  route to the real network), candidate rule loaded, traffic replayed via an
+  internal veth pair. Original implementation — unchanged by router or
+  output mode.
+- Router mode (FORWARD chain): three containers (attacker, firewall, target)
+  with genuine Docker-network routing between them, candidate rule loaded on
+  the firewall's FORWARD chain. Added because host mode's single-container
+  approach never actually exercises FORWARD-chain rules at all — see
+  ADR-038 and ADR-039.
+- Output mode (OUTPUT chain): reuses host mode's exact container/veth setup,
+  but generates traffic as genuine locally-originated connections (bash's
+  /dev/tcp or /dev/udp) instead of tcpreplay-injected frames — OUTPUT only
+  ever fires for packets the container's own kernel constructs, never for
+  injected/received ones. Added because a rule targeting OUTPUT was
+  previously silently misrouted to host mode's INPUT-chain check, which
+  would never see it match anything at all. See ADR-040.
 
 Core guarantee: no untested rule ever reaches the live firewall.
 """
@@ -10,8 +26,10 @@ Core guarantee: no untested rule ever reaches the live firewall.
 import io
 import logging
 import os
+import re
 import tarfile
 import tempfile
+import uuid
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
@@ -45,6 +63,13 @@ DOCKERFILE_DIR = Path(__file__).resolve().parent
 # still meaningfully exercised within each flow's own capped burst.
 MAX_PACKETS_PER_FLOW = 50
 MAX_REPLAY_SECONDS_PER_FLOW = 2.0
+
+# A DROPped SYN gets no RST, so an unbounded /dev/tcp connect() blocks on the
+# kernel's own SYN-retry timeout (many minutes, several retries with
+# exponential backoff) instead of failing fast the way a REJECT or a refused
+# loopback connection does. Each egress attempt must be individually bounded
+# or a single DROP-matching flow can hang the whole test. See ADR-040.
+EGRESS_CONNECT_TIMEOUT_SECONDS = 2
 
 # Injection interface: a veth pair created inside the isolated container.
 # tcpreplay has a known limitation injecting onto `lo` (ARPHRD_LOOPBACK framing
@@ -101,7 +126,7 @@ def fetch_recent_traffic(client: Client, minutes: int = 10) -> pd.DataFrame:
     return pd.DataFrame(rows, columns=columns)
 
 
-def _build_flow_pcap(flow: pd.Series) -> bytes:
+def _build_flow_pcap(flow: pd.Series, dst_mac: str = BROADCAST_MAC) -> bytes:
     """Synthesize packets representing one traffic_events flow into pcap bytes.
 
     traffic_events stores per-flow summaries (bytes/packets/duration), not raw
@@ -112,6 +137,11 @@ def _build_flow_pcap(flow: pd.Series) -> bytes:
     are evenly spaced across the (capped) duration so replay rate roughly
     matches the original flow, which is enough to exercise both plain
     match/DROP rules and single-flow rate-limit rules.
+
+    dst_mac defaults to broadcast (host mode's veth pair requires this — see
+    ADR-020). Router mode passes the firewall's real MAC explicitly instead —
+    a broadcast destination is silently dropped somewhere in Docker's bridge
+    delivery path there (confirmed empirically; see ADR-039).
     """
     packet_count = max(1, min(int(flow["packets"]), MAX_PACKETS_PER_FLOW))
     avg_size = max(1, int(flow["bytes"]) // packet_count)
@@ -132,7 +162,7 @@ def _build_flow_pcap(flow: pd.Series) -> bytes:
     packets = []
     for i in range(packet_count):
         pkt = (
-            Ether(src=SENDER_MAC, dst=BROADCAST_MAC)
+            Ether(src=SENDER_MAC, dst=dst_mac)
             / IP(src=str(flow["src_ip"]), dst=str(flow["dst_ip"]))
             / layer
             / Raw(load=b"x" * avg_size)
@@ -284,6 +314,346 @@ def _replay_all_flows(command: str, traffic: pd.DataFrame) -> list[FlowResult]:
     return results
 
 
+# ============================================================================
+# ROUTER MODE (FORWARD chain) — attacker -> firewall -> target
+#
+# Host mode above is untouched by everything below. Router mode exists
+# because aliasing a flow's destination IP onto one container's own
+# interface (host mode's approach) makes the kernel treat replayed traffic as
+# locally delivered, which always goes through INPUT — FORWARD is never
+# evaluated no matter which chain's counters get checked. A rule that
+# targets FORWARD needs packets to genuinely cross from one host's network
+# namespace, through a second host's routing decision, toward a third host,
+# for FORWARD to mean anything. See ADR-038 (the gap) and ADR-039 (this fix).
+# ============================================================================
+
+FORWARD_CHAIN_PATTERN = re.compile(r"-[AIDR]\s+FORWARD\b")
+OUTPUT_CHAIN_PATTERN = re.compile(r"-[AIDR]\s+OUTPUT\b")
+
+ROUTER_CAPS = ["NET_ADMIN", "NET_RAW"]
+
+
+def _detect_chain(command: str) -> str:
+    """Detect which iptables chain a candidate rule targets.
+
+    Returns "FORWARD", "OUTPUT", or "INPUT" — the last being the
+    default/existing assumption, preserving host-mode testing for every rule
+    shape seen before router/output mode existed. FORWARD is checked first:
+    a command matching both (unusual, but possible for a multi-statement
+    rule) is treated as FORWARD, since that's the chain more likely to be
+    silently under-tested if mis-detected.
+    """
+    if FORWARD_CHAIN_PATTERN.search(command):
+        return "FORWARD"
+    if OUTPUT_CHAIN_PATTERN.search(command):
+        return "OUTPUT"
+    return "INPUT"
+
+
+def _create_router_networks(client: docker.DockerClient) -> tuple[Any, Any]:
+    """Create the two Docker networks for router mode's attacker/firewall/target topology.
+
+    Deliberately NOT internal=True: empirically, Docker Desktop's networking
+    backend silently blocks inter-container FORWARD-chain traffic through a
+    multi-homed container on internal networks (confirmed by testing — a
+    LOG-all rule on FORWARD stayed at 0 packets with internal=True, and
+    started counting immediately once removed), even though internal
+    networks are documented as only blocking *external* routing. Isolation
+    from the real network is enforced instead by stripping each container's
+    default route after it starts (_strip_default_route) — the containers
+    then have no path anywhere except their two directly-connected /16s and
+    the one static route added per flow under test.
+    """
+    suffix = uuid.uuid4().hex[:8]
+    attacker_net = client.networks.create(f"fwai-router-attacker-{suffix}", driver="bridge")
+    target_net = client.networks.create(f"fwai-router-target-{suffix}", driver="bridge")
+    return attacker_net, target_net
+
+
+def _strip_default_route(container: Container) -> None:
+    """Remove a container's default route so it has no path to the real network.
+
+    Docker assigns a default route via the bridge gateway to every container
+    on a (non-internal) network. Without removing it, router-mode containers
+    could reach the real internet through the host's NAT — this is what
+    keeps router mode's safety guarantee equivalent to host mode's
+    --network none.
+    """
+    container.exec_run(["ip", "route", "del", "default"])
+
+
+def _start_router_topology(client: docker.DockerClient) -> dict[str, Any]:
+    """Stand up the attacker/firewall/target containers and wire their networks.
+
+    firewall is multi-homed (attacker_net + target_net) and is where the
+    candidate rule actually gets loaded, on its FORWARD chain.
+
+    Builds the topology dict incrementally and tears down whatever was
+    already created if any step fails partway through — three containers and
+    two networks is a lot more to leak than host mode's single container, so
+    this is deliberately more defensive than host mode's _start_container.
+    """
+    topology: dict[str, Any] = {}
+    try:
+        topology["attacker_net"], topology["target_net"] = _create_router_networks(client)
+        attacker_net, target_net = topology["attacker_net"], topology["target_net"]
+
+        topology["attacker"] = client.containers.run(
+            SANDBOX_IMAGE, detach=True, network=attacker_net.name, cap_add=ROUTER_CAPS
+        )
+        topology["firewall"] = client.containers.run(
+            SANDBOX_IMAGE, detach=True, network=attacker_net.name, cap_add=ROUTER_CAPS
+        )
+        topology["target"] = client.containers.run(
+            SANDBOX_IMAGE, detach=True, network=target_net.name, cap_add=ROUTER_CAPS
+        )
+        firewall = topology["firewall"]
+        target_net.connect(firewall)
+
+        for key in ("attacker", "firewall", "target"):
+            _strip_default_route(topology[key])
+
+        # Docker Desktop's VM already has ip_forward=1 at the host level,
+        # which this project's container runtime inherits even though
+        # writing to /proc/sys/net/ipv4/ip_forward from inside the container
+        # is read-only (confirmed empirically) — so a failed write is only
+        # fatal if the value genuinely isn't 1.
+        firewall.exec_run(["sh", "-c", "echo 1 > /proc/sys/net/ipv4/ip_forward"])
+        _, check_output = firewall.exec_run(["cat", "/proc/sys/net/ipv4/ip_forward"])
+        if check_output.decode().strip() != "1":
+            raise SandboxTestError(
+                "ip_forward is not enabled on the router-mode firewall container"
+            )
+    except Exception:
+        _teardown_router_topology(topology)
+        raise
+
+    return topology
+
+
+def _teardown_router_topology(topology: dict[str, Any]) -> None:
+    """Remove all router-mode containers and networks, best-effort.
+
+    Tolerant of a partially-built topology (e.g. setup failed partway
+    through) — only tears down whatever actually got created.
+    """
+    for key in ("attacker", "firewall", "target"):
+        container = topology.get(key)
+        if container is None:
+            continue
+        try:
+            container.remove(force=True)
+        except docker.errors.APIError as e:
+            logger.warning(f"Failed to remove router-mode container {key}: {e}")
+
+    for key in ("attacker_net", "target_net"):
+        network = topology.get(key)
+        if network is None:
+            continue
+        try:
+            network.remove()
+        except docker.errors.APIError as e:
+            logger.warning(f"Failed to remove router-mode network {key}: {e}")
+
+
+def _firewall_facing_mac(container: Container, network_name: str) -> str:
+    """Look up a container's MAC address on a specific Docker network.
+
+    Router-mode packets must be addressed (L2) to the firewall's real MAC.
+    Unlike host mode's internal veth pair, a broadcast destination MAC is
+    silently dropped somewhere in Docker's bridge delivery path here —
+    confirmed empirically: identical packets with a real MAC traversed
+    FORWARD correctly; with a broadcast MAC, they never arrived at all.
+    """
+    container.reload()
+    return container.attrs["NetworkSettings"]["Networks"][network_name]["MacAddress"]
+
+
+def _container_ip(container: Container, network_name: str) -> str:
+    """Look up a container's IP address on a specific Docker network."""
+    container.reload()
+    return container.attrs["NetworkSettings"]["Networks"][network_name]["IPAddress"]
+
+
+def _replay_and_check_router(
+    firewall: Container, attacker: Container, pcap_path: str, dst_ip: str, target_ip: str
+) -> bool:
+    """Route dst_ip toward the target via the firewall, replay from the attacker,
+    and report whether the firewall's FORWARD chain blocked it.
+
+    `ip route replace` is idempotent, same as host mode's `ip addr replace`,
+    so repeated flows sharing a destination IP don't error.
+    """
+    firewall.exec_run(["ip", "route", "replace", f"{dst_ip}/32", "via", target_ip])
+    firewall.exec_run(["iptables", "-Z", "FORWARD"])
+
+    exit_code, output = attacker.exec_run(["tcpreplay", "--intf1=eth0", pcap_path])
+    if exit_code != 0:
+        raise SandboxTestError(f"tcpreplay failed (router mode): {output.decode(errors='replace')}")
+
+    exit_code, output = firewall.exec_run(["iptables", "-L", "FORWARD", "-v", "-n", "-x"])
+    return _any_drop_matched(output.decode(errors="replace"))
+
+
+def _replay_all_flows_router_mode(command: str, traffic: pd.DataFrame) -> list[FlowResult]:
+    """Replay each traffic flow through a genuine attacker -> firewall -> target topology."""
+    docker_client = docker.from_env()
+    _ensure_image(docker_client)
+    topology = _start_router_topology(docker_client)
+    attacker, firewall, target = topology["attacker"], topology["firewall"], topology["target"]
+
+    results: list[FlowResult] = []
+    try:
+        _load_rule(firewall, command)  # reused unchanged -- just a different container
+
+        firewall_mac = _firewall_facing_mac(firewall, topology["attacker_net"].name)
+        target_ip = _container_ip(target, topology["target_net"].name)
+
+        for _, flow in traffic.iterrows():
+            try:
+                pcap_bytes = _build_flow_pcap(flow, dst_mac=firewall_mac)
+                pcap_path = _put_pcap(attacker, pcap_bytes)  # reused unchanged
+                blocked = _replay_and_check_router(
+                    firewall, attacker, pcap_path, str(flow["dst_ip"]), target_ip
+                )
+            except SandboxTestError as e:
+                logger.warning(
+                    f"Skipping flow {flow['src_ip']}->{flow['dst_ip']} (router mode): {e}"
+                )
+                continue
+
+            results.append(
+                FlowResult(
+                    src_ip=str(flow["src_ip"]),
+                    dst_ip=str(flow["dst_ip"]),
+                    dst_port=int(flow["dst_port"]),
+                    packets=int(flow["packets"]),
+                    bytes=int(flow["bytes"]),
+                    anomaly_score=float(flow["anomaly_score"]),
+                    blocked=blocked,
+                )
+            )
+    finally:
+        _teardown_router_topology(topology)
+
+    return results
+
+
+# ============================================================================
+# OUTPUT MODE (traffic leaving the firewall itself)
+#
+# Reuses host mode's exact container/veth setup unchanged (_start_container,
+# _load_rule, _any_drop_matched) — OUTPUT chain fires for any packet the
+# container's own kernel constructs, *including* one addressed to an IP
+# aliased onto its own interface (confirmed empirically: a real connection
+# attempt to a locally-aliased address traverses OUTPUT before the kernel
+# short-circuits it to local delivery). What has to differ from host mode is
+# how traffic is generated: tcpreplay's injected frames are inbound, never
+# locally-originated, so they can only ever hit INPUT or FORWARD — never
+# OUTPUT. Genuine egress traffic instead comes from real socket connections
+# made from inside the container. See ADR-040.
+# ============================================================================
+
+def _build_egress_script(dst_ip: str, dst_port: int, protocol: str, count: int) -> str:
+    """Build a shell snippet that attempts `count` real outbound connections.
+
+    Uses bash's /dev/tcp and /dev/udp, which genuinely traverse the kernel's
+    own egress path (confirmed empirically against OUTPUT chain counters) —
+    unlike tcpreplay, which cannot generate locally-originated traffic at
+    all. Raises SandboxTestError for protocols with no real egress-generation
+    mechanism available here (ICMP: no ping-equivalent tool is installable,
+    since --network none blocks all network access including apt — see
+    ADR-040). The caller treats that the same as any other skippable flow.
+
+    Each attempt is wrapped in `timeout` — a DROPped SYN produces no RST, so
+    an unbounded connect() blocks on the kernel's own SYN-retry timeout
+    (empirically observed: still retrying past 9 attempts / several minutes
+    with no cap). Without this, a single DROP-matching flow hangs the entire
+    test. See ADR-040.
+    """
+    if protocol == "TCP":
+        attempt = (
+            f"(timeout {EGRESS_CONNECT_TIMEOUT_SECONDS} "
+            f"bash -c 'exec 3<>/dev/tcp/{dst_ip}/{dst_port}') 2>/dev/null"
+        )
+    elif protocol == "UDP":
+        attempt = (
+            f"(timeout {EGRESS_CONNECT_TIMEOUT_SECONDS} "
+            f"bash -c 'exec 3<>/dev/udp/{dst_ip}/{dst_port} && echo x >&3') 2>/dev/null"
+        )
+    else:
+        raise SandboxTestError(
+            f"No real egress-generation mechanism for protocol {protocol!r} in "
+            "output mode (see ADR-040)"
+        )
+    return f"for i in $(seq 1 {count}); do {attempt}; done"
+
+
+def _replay_and_check_output(
+    container: Container, dst_ip: str, dst_port: int, protocol: str, count: int
+) -> bool:
+    """Alias dst_ip, generate real outbound connection attempts, and report
+    whether the container's own OUTPUT chain blocked them.
+
+    `ip addr replace` is idempotent, same as host mode's own per-flow setup.
+    Individual connection attempts are expected to fail/refuse/time out —
+    nothing is listening on the other end — that is not a sandbox error,
+    unlike tcpreplay's exit code, which does indicate a real injection
+    failure in the other two modes.
+    """
+    container.exec_run(["ip", "addr", "replace", f"{dst_ip}/32", "dev", PEER_IFACE])
+    container.exec_run(["iptables", "-Z", "OUTPUT"])
+
+    script = _build_egress_script(dst_ip, dst_port, protocol, count)
+    container.exec_run(["bash", "-c", script])
+
+    exit_code, output = container.exec_run(["iptables", "-L", "OUTPUT", "-v", "-n", "-x"])
+    return _any_drop_matched(output.decode(errors="replace"))
+
+
+def _replay_all_flows_output_mode(command: str, traffic: pd.DataFrame) -> list[FlowResult]:
+    """Replay each traffic flow as genuine outbound connections from a single container."""
+    docker_client = docker.from_env()
+    _ensure_image(docker_client)
+    container = _start_container(docker_client)  # reused unchanged -- host mode's own setup
+
+    results: list[FlowResult] = []
+    try:
+        _load_rule(container, command)  # reused unchanged -- just checked against OUTPUT after
+
+        for _, flow in traffic.iterrows():
+            try:
+                count = max(1, min(int(flow["packets"]), MAX_PACKETS_PER_FLOW))
+                blocked = _replay_and_check_output(
+                    container,
+                    str(flow["dst_ip"]),
+                    int(flow["dst_port"]),
+                    str(flow["protocol"]).upper(),
+                    count,
+                )
+            except SandboxTestError as e:
+                # Same convention as host/router mode: one bad flow (or, here,
+                # an unsupported protocol) shouldn't abort the whole test.
+                logger.warning(f"Skipping flow {flow['src_ip']}->{flow['dst_ip']} (output mode): {e}")
+                continue
+
+            results.append(
+                FlowResult(
+                    src_ip=str(flow["src_ip"]),
+                    dst_ip=str(flow["dst_ip"]),
+                    dst_port=int(flow["dst_port"]),
+                    packets=int(flow["packets"]),
+                    bytes=int(flow["bytes"]),
+                    anomaly_score=float(flow["anomaly_score"]),
+                    blocked=blocked,
+                )
+            )
+    finally:
+        container.remove(force=True)
+
+    return results
+
+
 def _pipeline_duration_seconds(trigger_event: dict[str, Any] | None) -> float | None:
     """Seconds from anomaly detection to now, if trigger_event carries a detected_at.
 
@@ -319,11 +689,20 @@ def run_sandbox_test(
     SANDBOX_TESTING rather than guessing a verdict — an infra failure is not
     the same as a rule failing its test, and the core guarantee means an
     unresolved rule must never be silently promoted.
+
+    Automatically dispatches to host mode (INPUT chain), router mode
+    (FORWARD chain), or output mode (OUTPUT chain) based on which chain the
+    rule's command targets — see _detect_chain, ADR-039, ADR-040. Never a
+    manual toggle.
     """
     if rule.get("syntax") != "iptables":
         raise SandboxTestError(
             f"Sandbox only supports iptables syntax on this Linux image, got {rule.get('syntax')!r}"
         )
+
+    chain = _detect_chain(rule["command"])
+    mode = {"FORWARD": "router", "OUTPUT": "output"}.get(chain, "host")
+    logger.info(f"Detected target chain={chain} -> testing in {mode} mode")
 
     rule_id = promoter.insert_pending_rule(rule, trigger_event)
     logger.info(f"Inserted candidate rule {rule_id} as PENDING")
@@ -336,18 +715,24 @@ def run_sandbox_test(
         logger.warning("No traffic in the last 10 minutes — nothing to replay")
         results: list[FlowResult] = []
     else:
+        replay_fns = {
+            "router": _replay_all_flows_router_mode,
+            "output": _replay_all_flows_output_mode,
+        }
+        replay_fn = replay_fns.get(mode, _replay_all_flows)
         try:
-            results = _replay_all_flows(rule["command"], traffic)
+            results = replay_fn(rule["command"], traffic)
         except InvalidRuleError as e:
             sandbox_result = {
                 "tested_at": datetime.now(timezone.utc).isoformat(),
                 "flows_tested": 0,
                 "error": str(e),
+                "mode": mode,
                 "pipeline_duration_seconds": _pipeline_duration_seconds(trigger_event),
             }
             promoter.reject(rule_id, sandbox_result, f"Invalid rule: {e}")
             logger.info(
-                f"Rule {rule_id} REJECTED (invalid syntax) in "
+                f"Rule {rule_id} REJECTED (invalid syntax, {mode} mode) in "
                 f"{sandbox_result['pipeline_duration_seconds']} s end to end"
             )
             return {"rule_id": str(rule_id), "passed": False, **sandbox_result}
@@ -357,6 +742,7 @@ def run_sandbox_test(
     sandbox_result = {
         "tested_at": datetime.now(timezone.utc).isoformat(),
         "flows_tested": len(results),
+        "mode": mode,
         "pipeline_duration_seconds": _pipeline_duration_seconds(trigger_event),
         **scored,
     }
@@ -364,14 +750,14 @@ def run_sandbox_test(
     if scored["passed"]:
         promoter.approve(rule_id, sandbox_result)
         logger.info(
-            f"Rule {rule_id} PASSED sandbox test (fp_rate={scored['fp_rate']:.4f}) "
+            f"Rule {rule_id} PASSED sandbox test ({mode} mode, fp_rate={scored['fp_rate']:.4f}) "
             f"-> APPROVED_PENDING in {sandbox_result['pipeline_duration_seconds']} s end to end"
         )
     else:
         reason = f"FP rate {scored['fp_rate']:.4f} exceeds threshold {scored['threshold']:.4f}"
         promoter.reject(rule_id, sandbox_result, reason)
         logger.info(
-            f"Rule {rule_id} REJECTED in "
+            f"Rule {rule_id} REJECTED ({mode} mode) in "
             f"{sandbox_result['pipeline_duration_seconds']} s end to end"
         )
 

@@ -7,8 +7,13 @@ Firewall AI — an autonomous cybersecurity platform with 5 defense layers that 
 Building Layer 1 MVP — AI-driven sandboxed firewall rule generation engine.
 Backend skeleton, data ingestion pipeline, ML core, sandbox testing, and the frontend
 dashboard are built. The two backend gaps this left (traffic endpoints were stubs, no
-WebSocket route existed) are now closed — Layer 1 is functional end-to-end. Next up is
-Celery + Redis async jobs.
+WebSocket route existed) are now closed — Layer 1 is functional end-to-end. The sandbox
+now has three testing modes, auto-dispatched by chain: host mode (INPUT), router mode
+(FORWARD), and output mode (OUTPUT, for traffic leaving the firewall/host itself, e.g.
+blocking exfiltration/C2 beaconing) — each verified to genuinely block bad traffic and
+pass legitimate traffic, not just load without error. Output mode has one known gap:
+ICMP flows can't be tested (no ping-equivalent tool available under `--network none`).
+Next up is Celery + Redis async jobs.
 
 ## Repo structure
 ```

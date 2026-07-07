@@ -212,17 +212,26 @@ file is rendered with `str.format()` — see ADR-018.
 
 ## Sandbox design
 
-Implemented in `sandbox/` (Dockerfile, tester.py, fp_scorer.py, promoter.py):
+Implemented in `sandbox/` (Dockerfile, tester.py, fp_scorer.py, promoter.py). Three testing
+modes, auto-selected — **never a manual toggle** — by `tester.py`'s `_detect_chain()`,
+which inspects the candidate rule's `command` for `-A/-I/-D/-R FORWARD` or `-A/-I/-D/-R
+OUTPUT` (checked in that order), falling back to host/`INPUT` mode for everything else:
 
 ```
 sandbox/Dockerfile    — Ubuntu image with iptables + tcpreplay + iproute2 pre-installed
-sandbox/tester.py     — orchestrates: fetch traffic, replay per flow, collect results
-sandbox/fp_scorer.py  — FP rate = blocked non-anomalous packets / total non-anomalous packets
+                        (shared by all three modes — no changes needed for router or
+                        output mode)
+sandbox/tester.py     — orchestrates: detect chain, dispatch to host, router, or output
+                        mode, fetch traffic, replay per flow, collect results
+sandbox/fp_scorer.py  — FP rate = blocked non-anomalous packets / total non-anomalous
+                        packets (mode-agnostic — reads only FlowResult, unchanged)
 sandbox/promoter.py   — PostgreSQL: PENDING -> SANDBOX_TESTING -> APPROVED_PENDING or REJECTED
 ```
 
-The sandbox container runs with `--network none` (no access to the real network) and
-`--cap-add=NET_ADMIN --cap-add=NET_RAW`. Each traffic flow from ClickHouse's
+### Host mode (INPUT chain) — the original design, unchanged
+
+A single isolated container runs with `--network none` (no access to the real network)
+and `--cap-add=NET_ADMIN --cap-add=NET_RAW`. Each traffic flow from ClickHouse's
 `traffic_events` is replayed **independently** against the loaded candidate rule:
 
 1. Reconstruct that flow's packets with scapy (traffic_events stores flow summaries,
@@ -237,19 +246,89 @@ The veth pair (not `lo`, not a `dummy` interface) is required — see ADR-020 fo
 both alternatives silently fail to reach netfilter at all. Destination MAC must be
 broadcast (`ff:ff:ff:ff:ff:ff`) or the receiving interface drops the frame at L2.
 
-A candidate rule that fails to even load into iptables (invalid syntax) is a rejected
-verdict, same as a rule that blocks too much legitimate traffic — not an infrastructure
-failure. See ADR-023.
+Host mode only ever meaningfully validates `INPUT`-chain rules — aliasing the
+destination IP onto the container's own interface makes the kernel treat traffic as
+locally delivered, so `FORWARD` is never evaluated no matter which chain's counters get
+checked (see ADR-038, the gap this originally exposed).
 
-FP scorer measures:
+### Router mode (FORWARD chain) — added for rules that route traffic through the box
+
+Three containers — **attacker**, **firewall** (multi-homed; the candidate rule loads
+here, on its `FORWARD` chain), **target** — connected via two real Docker bridge
+networks, so traffic genuinely routes attacker → firewall → target and `FORWARD` gets
+evaluated for real:
+
+1. `firewall` connects to both networks (`eth0` toward attacker, `eth1` toward target);
+   `ip_forward` is already `1` under Docker Desktop's networking backend.
+2. Per flow: `firewall` gets an explicit `ip route replace <dst_ip>/32 via <target's
+   real IP>` (idempotent, same pattern as host mode's `ip addr replace`); packets are
+   built with the same scapy helper as host mode, but addressed (L2) to the
+   **firewall's real MAC** rather than broadcast — broadcast is silently dropped
+   somewhere in Docker's bridge delivery path here, the opposite of host mode's veth
+   pair, where broadcast is required.
+3. `tcpreplay` injects from `attacker`'s `eth0`; zero + read `firewall`'s `FORWARD`
+   chain counters, same DROP/REJECT-with-nonzero-packets check as host mode
+   (`_any_drop_matched`, reused unchanged).
+
+Isolation from the real network (equivalent to host mode's `--network none`) is
+enforced by **deleting each container's default route** after it starts, not by
+`internal=True` networks — Docker Desktop's networking backend was found to silently
+block inter-container `FORWARD` traffic through a multi-homed container on internal
+networks. See ADR-039 for the full empirical trail (what was tried, what didn't work,
+and why) and ADR-020 for host mode's own equivalent discovery process.
+
+### Output mode (OUTPUT chain) — traffic leaving the firewall/host itself
+
+Reuses host mode's exact container/veth setup **unchanged** (`_start_container`,
+`_load_rule`, `_any_drop_matched`) — no new topology, unlike router mode. `OUTPUT`
+fires for any packet the container's own kernel constructs, including one addressed to
+an IP aliased onto its own interface, confirmed empirically: a real connection attempt
+to a locally-aliased address traverses `OUTPUT` before the kernel short-circuits it to
+local delivery.
+
+What differs from host mode is purely how traffic is generated: `tcpreplay`'s injected
+frames are inbound by construction and can only ever hit `INPUT` or `FORWARD` — never
+`OUTPUT`, since `OUTPUT` only fires for locally-originated packets. Genuine egress
+traffic instead comes from real socket connections made from inside the container:
+
+1. Alias the flow's `dst_ip` onto the container's interface (`ip addr replace`, same
+   idempotent pattern host mode already uses).
+2. Zero the `OUTPUT` chain counters.
+3. Run a shell loop attempting `count` real connections via bash's `/dev/tcp` (TCP) or
+   `/dev/udp` (UDP) — each individual attempt wrapped in `timeout 2s`. This is required,
+   not cosmetic: a `DROP`ped SYN produces no RST, so an unbounded connect() blocks on the
+   kernel's own SYN-retry timeout — this hung an early test run for 27+ minutes on a
+   single flow before the per-attempt timeout was added. See ADR-040.
+4. Read `OUTPUT`'s counters back — same DROP/REJECT-with-nonzero-packets check as the
+   other two modes (`_any_drop_matched`, reused unchanged).
+
+**Known limitation, not hidden**: ICMP flows have no real egress-generation mechanism
+here — there's no `ping`-equivalent tool in the sandbox image, and `--network none`
+blocks installing one. `_build_egress_script()` raises for any protocol other than
+TCP/UDP; the replay loop skips that flow (same convention as any other skippable-flow
+error) and logs a warning. An `OUTPUT` rule's behavior against ICMP traffic is therefore
+never validated by the sandbox — the `fp_rate` verdict is silently computed over
+TCP/UDP flows only.
+
+A candidate rule that fails to even load into iptables (invalid syntax) is a rejected
+verdict in all three modes, same as a rule that blocks too much legitimate traffic — not
+an infrastructure failure. See ADR-023.
+
+FP scorer measures (identically across all three modes):
 ```
 FP rate = packets blocked by rule that are NOT anomalous / total non-anomalous packets
 ```
 "Anomalous" is decided by each flow's stored `anomaly_score` exceeding 0.5 (matching
-`ml/anomaly.py`'s `detect_anomalies()` default threshold).
+`ml/anomaly.py`'s `detect_anomalies()` default threshold). For router and output mode
+this is exactly "what percentage of legitimate traffic would have been wrongly
+blocked" — the same formula applies unchanged since it only reads `FlowResult.blocked`,
+agnostic to which chain produced that boolean.
 
 Threshold: FP rate > 5% → reject rule.
 Configurable via SANDBOX_FP_THRESHOLD env var.
+
+`sandbox_result["mode"]` (`"host"`, `"router"`, or `"output"`) is recorded for every
+test, so a rule's stored history always shows which mode validated it.
 
 ---
 

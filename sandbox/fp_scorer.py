@@ -38,6 +38,13 @@ def score_replay(
 
     FP rate = packets blocked by the rule that are NOT anomalous
               / total non-anomalous packets.
+
+    Mode-agnostic by design — this only reads FlowResult.blocked, which
+    tester.py's host mode (INPUT chain) and router mode (FORWARD chain, see
+    ADR-039) each populate their own way. For router mode this reads exactly
+    as the task requires: the percentage of legitimate attacker-to-target
+    traffic that would have been wrongly blocked. No mode-specific logic was
+    needed here — verified, not overlooked.
     """
     non_anomalous = [r for r in results if r.anomaly_score <= ANOMALY_SCORE_THRESHOLD]
     anomalous = [r for r in results if r.anomaly_score > ANOMALY_SCORE_THRESHOLD]
