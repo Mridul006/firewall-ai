@@ -18,6 +18,22 @@ traffic_events data goes stale between sessions — run `scripts/seed_demo_data.
 before any demo to refresh it with current-timestamp data in one command (see
 scripts/README.md and ADR-041).
 
+Three governance gaps are now closed and verified with real data: audit logging
+(`audit_log` table was documented but never implemented — it now records every
+approve/reject/revoke with who/when/what, queryable via `GET /api/v1/audit/`; a real
+frozen-timestamp bug was found and fixed along the way, see ADR-044), rollback (the
+revoke endpoint already worked, but the frontend had no button to call it — added, see
+ADR-045), and policy conflict checking (candidate rules are now compared against
+every LIVE rule for duplicates/contradictions and flagged for human review in the
+dashboard, never auto-rejected — see ADR-046). The two new frontend pieces (Revoke
+button, conflict banner) were verified by build/lint and direct API calls, not by
+clicking through an actual browser — no Playwright/browser tool was available this
+session. **Pushing any rule to a real firewall device remains intentionally deferred**
+— LIVE in this system means "approved in the HITL workflow and tracked as active,"
+not "actually enforced on real network hardware." That integration is deliberately
+not built until there's a real target environment or design partner to build it
+against, not a gap to silently close later.
+
 ## Repo structure
 ```
 firewall-ai/

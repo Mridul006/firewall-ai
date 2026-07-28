@@ -42,6 +42,7 @@ from docker.models.containers import Container
 from dotenv import load_dotenv
 from scapy.all import ICMP, IP, TCP, UDP, Ether, Raw, wrpcap
 
+import conflict_checker
 import promoter
 from fp_scorer import FlowResult, score_replay
 
@@ -767,11 +768,28 @@ def run_sandbox_test(
 
     scored = score_replay(results)
 
+    # Policy conflict check against currently-LIVE rules -- purely
+    # informational (see ADR-044). Never affects passed/rejected: the human
+    # reviewer sees any conflict in the dashboard and decides, the system
+    # never auto-rejects on this basis alone, per the explicit design
+    # requirement.
+    try:
+        policy_conflicts = conflict_checker.check_conflicts(
+            rule["command"], promoter.get_live_rules()
+        )
+    except Exception as e:
+        # A conflict-check failure (e.g. a transient DB error) must not
+        # block the rule reaching its otherwise-earned verdict -- this is an
+        # advisory check, not part of the core guarantee.
+        logger.warning(f"Policy conflict check failed, continuing without it: {e}")
+        policy_conflicts = []
+
     sandbox_result = {
         "tested_at": datetime.now(timezone.utc).isoformat(),
         "flows_tested": len(results),
         "mode": mode,
         "pipeline_duration_seconds": _pipeline_duration_seconds(trigger_event),
+        "policy_conflicts": policy_conflicts,
         **scored,
     }
 
@@ -780,9 +798,10 @@ def run_sandbox_test(
         detection_str = (
             "n/a" if scored["detection_rate"] is None else f"{scored['detection_rate']:.4f}"
         )
+        conflict_str = f", {len(policy_conflicts)} policy conflict(s)" if policy_conflicts else ""
         logger.info(
             f"Rule {rule_id} PASSED sandbox test ({mode} mode, fp_rate={scored['fp_rate']:.4f}, "
-            f"detection_rate={detection_str}) "
+            f"detection_rate={detection_str}{conflict_str}) "
             f"-> APPROVED_PENDING in {sandbox_result['pipeline_duration_seconds']} s end to end"
         )
     else:

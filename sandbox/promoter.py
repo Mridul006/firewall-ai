@@ -67,6 +67,18 @@ def mark_testing(rule_id: uuid.UUID) -> None:
     _set_status(rule_id, "SANDBOX_TESTING")
 
 
+def get_live_rules() -> list[dict[str, Any]]:
+    """Fetch id and command for every currently-LIVE rule, for policy conflict checking."""
+    try:
+        with _get_connection() as conn, conn.cursor() as cur:
+            cur.execute("SELECT id, command FROM candidate_rules WHERE status = 'LIVE'")
+            rows = cur.fetchall()
+    except psycopg.Error as e:
+        logger.error(f"Failed to fetch LIVE rules for conflict checking: {e}")
+        raise
+    return [{"id": row[0], "command": row[1]} for row in rows]
+
+
 def approve(rule_id: uuid.UUID, sandbox_result: dict[str, Any]) -> None:
     """Mark a rule APPROVED_PENDING after it passes its sandbox test.
 

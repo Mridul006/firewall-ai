@@ -3,11 +3,11 @@ import { useState } from 'react'
 import RuleList from '../components/RuleList'
 import { useRules } from '../hooks/useRules'
 
-const TABS = ['PENDING', 'APPROVED_PENDING', 'LIVE', 'REJECTED']
+const TABS = ['PENDING', 'APPROVED_PENDING', 'LIVE', 'REJECTED', 'REVOKED']
 
 export default function Rules() {
   const [activeTab, setActiveTab] = useState(TABS[0])
-  const { rules, loading, error, approveRule, rejectRule } = useRules(activeTab)
+  const { rules, loading, error, approveRule, rejectRule, revokeRule } = useRules(activeTab)
 
   return (
     <div className="p-6">
@@ -37,6 +37,7 @@ export default function Rules() {
           error={error}
           onApprove={approveRule}
           onReject={rejectRule}
+          onRevoke={revokeRule}
         />
       </div>
     </div>

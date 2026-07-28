@@ -1,6 +1,6 @@
 import RuleCard from './RuleCard'
 
-export default function RuleList({ rules, loading, error, onApprove, onReject }) {
+export default function RuleList({ rules, loading, error, onApprove, onReject, onRevoke }) {
   if (loading) {
     return <div className="text-sm text-gray-500">Loading rules…</div>
   }
@@ -16,7 +16,13 @@ export default function RuleList({ rules, loading, error, onApprove, onReject })
   return (
     <div className="grid grid-cols-1 gap-4 md:grid-cols-2 lg:grid-cols-3">
       {rules.map((rule) => (
-        <RuleCard key={rule.id} rule={rule} onApprove={onApprove} onReject={onReject} />
+        <RuleCard
+          key={rule.id}
+          rule={rule}
+          onApprove={onApprove}
+          onReject={onReject}
+          onRevoke={onRevoke}
+        />
       ))}
     </div>
   )

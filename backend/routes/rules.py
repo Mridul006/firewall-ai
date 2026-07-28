@@ -9,6 +9,8 @@ from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from core.db import get_db
+from models.audit_log import AuditAction
+from models.audit_log import record as record_audit_log
 from models.rule import CandidateRule, RuleResponse, RuleStatus
 from models.user import User
 from routes.auth import get_current_user
@@ -56,9 +58,21 @@ async def approve_rule(
             detail=f"Rule must be {RuleStatus.APPROVED_PENDING.value} to approve",
         )
 
+    previous_status = rule.status
     rule.status = RuleStatus.LIVE.value
     rule.approved_by = current_user.id
     rule.approved_at = datetime.now(timezone.utc)
+    await record_audit_log(
+        db,
+        actor_id=current_user.id,
+        action=AuditAction.RULE_APPROVED,
+        rule_id=rule.id,
+        metadata={
+            "from_status": previous_status,
+            "to_status": rule.status,
+            "command": rule.command,
+        },
+    )
     await _commit(db)
     return rule
 
@@ -71,7 +85,19 @@ async def reject_rule(
 ) -> CandidateRule:
     """Human rejects a pending rule."""
     rule = await _get_rule_or_404(rule_id, db)
+    previous_status = rule.status
     rule.status = RuleStatus.REJECTED.value
+    await record_audit_log(
+        db,
+        actor_id=current_user.id,
+        action=AuditAction.RULE_REJECTED,
+        rule_id=rule.id,
+        metadata={
+            "from_status": previous_status,
+            "to_status": rule.status,
+            "command": rule.command,
+        },
+    )
     await _commit(db)
     return rule
 
@@ -87,7 +113,19 @@ async def revoke_rule(
     if rule.status != RuleStatus.LIVE.value:
         raise HTTPException(status_code=400, detail="Only a LIVE rule can be revoked")
 
+    previous_status = rule.status
     rule.status = RuleStatus.REVOKED.value
+    await record_audit_log(
+        db,
+        actor_id=current_user.id,
+        action=AuditAction.RULE_REVOKED,
+        rule_id=rule.id,
+        metadata={
+            "from_status": previous_status,
+            "to_status": rule.status,
+            "command": rule.command,
+        },
+    )
     await _commit(db)
     return rule
 

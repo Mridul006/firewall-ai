@@ -8,7 +8,7 @@ from fastapi.middleware.cors import CORSMiddleware
 
 from core.config import settings
 from core.db import Base, engine
-from routes import auth, dashboard, rules, traffic, websocket
+from routes import audit, auth, dashboard, rules, traffic, websocket
 from routes.websocket import poll_and_broadcast_alerts
 
 
@@ -38,6 +38,7 @@ app.include_router(rules.router)
 app.include_router(traffic.router)
 app.include_router(dashboard.router)
 app.include_router(websocket.router)
+app.include_router(audit.router)
 
 
 @app.get("/health", tags=["health"])

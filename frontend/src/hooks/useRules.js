@@ -50,5 +50,26 @@ export function useRules(statusFilter) {
     }
   }
 
-  return { rules, loading, error, actionError, refetch: fetchRules, approveRule, rejectRule }
+  async function revokeRule(ruleId) {
+    setActionError(null)
+    try {
+      await api.post(`/api/v1/rules/${ruleId}/revoke`)
+      await fetchRules()
+      return true
+    } catch (err) {
+      setActionError(err.response?.data?.detail || 'Failed to revoke rule')
+      return false
+    }
+  }
+
+  return {
+    rules,
+    loading,
+    error,
+    actionError,
+    refetch: fetchRules,
+    approveRule,
+    rejectRule,
+    revokeRule,
+  }
 }

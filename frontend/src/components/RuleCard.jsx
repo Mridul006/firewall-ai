@@ -9,7 +9,7 @@ const STATUS_STYLES = {
   REVOKED: 'bg-gray-200 text-gray-700',
 }
 
-export default function RuleCard({ rule, onApprove, onReject }) {
+export default function RuleCard({ rule, onApprove, onReject, onRevoke }) {
   const [actionLoading, setActionLoading] = useState(false)
   const [actionError, setActionError] = useState(null)
 
@@ -29,10 +29,20 @@ export default function RuleCard({ rule, onApprove, onReject }) {
     setActionLoading(false)
   }
 
+  async function handleRevoke() {
+    if (!window.confirm('Revoke this live rule? It will stop being enforced.')) return
+    setActionLoading(true)
+    setActionError(null)
+    const ok = await onRevoke(rule.id)
+    if (!ok) setActionError('Failed to revoke rule')
+    setActionLoading(false)
+  }
+
   const fpRatePercent =
     typeof rule.fp_rate === 'number' ? `${(rule.fp_rate * 100).toFixed(2)}%` : '—'
   const confidencePercent =
     typeof rule.confidence === 'number' ? `${(rule.confidence * 100).toFixed(0)}%` : '—'
+  const policyConflicts = rule.sandbox_result?.policy_conflicts || []
 
   return (
     <div className="rounded-lg border border-gray-200 bg-white p-4 shadow-sm dark:border-gray-700 dark:bg-gray-800">
@@ -72,6 +82,19 @@ export default function RuleCard({ rule, onApprove, onReject }) {
         </div>
       </dl>
 
+      {policyConflicts.length > 0 && (
+        <div className="mt-3 rounded-md border border-amber-300 bg-amber-50 p-2 dark:border-amber-700 dark:bg-amber-900/30">
+          <p className="text-xs font-semibold text-amber-800 dark:text-amber-300">
+            ⚠ {policyConflicts.length} policy conflict{policyConflicts.length > 1 ? 's' : ''} with LIVE rules — review before approving
+          </p>
+          <ul className="mt-1 list-inside list-disc text-xs text-amber-700 dark:text-amber-400">
+            {policyConflicts.map((conflict, i) => (
+              <li key={i}>{conflict.message}</li>
+            ))}
+          </ul>
+        </div>
+      )}
+
       {actionError && (
         <p className="mt-2 rounded-md bg-red-50 p-2 text-xs text-red-700">{actionError}</p>
       )}
@@ -93,6 +116,19 @@ export default function RuleCard({ rule, onApprove, onReject }) {
             className="rounded-md bg-red-600 px-3 py-1.5 text-sm font-medium text-white hover:bg-red-700 disabled:opacity-50"
           >
             {actionLoading ? 'Working…' : 'Reject'}
+          </button>
+        </div>
+      )}
+
+      {rule.status === 'LIVE' && (
+        <div className="mt-3 flex gap-2">
+          <button
+            type="button"
+            onClick={handleRevoke}
+            disabled={actionLoading}
+            className="rounded-md bg-gray-600 px-3 py-1.5 text-sm font-medium text-white hover:bg-gray-700 disabled:opacity-50"
+          >
+            {actionLoading ? 'Working…' : 'Revoke'}
           </button>
         </div>
       )}

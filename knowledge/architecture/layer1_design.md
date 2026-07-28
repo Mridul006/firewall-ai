@@ -110,13 +110,24 @@ CREATE TABLE candidate_rules (
 ```sql
 CREATE TABLE audit_log (
     id          UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-    timestamp   TIMESTAMPTZ DEFAULT NOW(),
+    timestamp   TIMESTAMPTZ,             -- Python-side default, NOT server_default="now()" — see ADR-044
     actor_id    UUID REFERENCES users(id),
     action      VARCHAR(50),            -- RULE_APPROVED, RULE_REJECTED, RULE_REVOKED
     rule_id     UUID REFERENCES candidate_rules(id),
     metadata    JSONB
 );
 ```
+
+Implemented (`backend/models/audit_log.py`) — this table was documented here for a while
+before it actually existed; it does now. Every `approve`/`reject`/`revoke` in
+`routes/rules.py` writes an entry in the **same transaction** as the status change it
+documents, via `record()`. `timestamp` deliberately uses a Python-side default
+(`datetime.now(timezone.utc)`), not `server_default="now()"` — that pattern, copied from
+`users.created_at`/`candidate_rules.created_at`, turned out to be a real bug: SQLAlchemy
+quotes a bare string into `DEFAULT 'now()'`, which Postgres freezes into a literal
+timestamp at table-creation time instead of a live per-row call. See ADR-044 for the full
+finding (that bug still affects `users`/`candidate_rules`, left unfixed there — out of
+scope for this task).
 
 ---
 
@@ -128,11 +139,17 @@ GET    /api/v1/rules/{id}          — get single rule with full details
 POST   /api/v1/rules/{id}/approve  — human approves pending rule (HITL)
 POST   /api/v1/rules/{id}/reject   — human rejects pending rule
 POST   /api/v1/rules/{id}/revoke   — revoke a live rule
+GET    /api/v1/audit/              — audit log, filterable by ?rule_id= / ?action=, auth required
 GET    /api/v1/traffic/            — recent traffic events with anomaly scores (?minutes=, default 60)
 GET    /api/v1/traffic/anomalies   — only events with anomaly_score > ANOMALY_ALERT_THRESHOLD
 GET    /api/v1/dashboard/stats     — summary stats for dashboard (rule counts + real ClickHouse 24h counts)
 WS     /api/v1/ws/alerts           — real-time alerts: rule status changes + high-severity anomalies
 ```
+
+`GET /api/v1/audit/` (`backend/routes/audit.py`) is the one GET route in this API that
+**requires authentication** — every other GET route here is open. Deliberate: an
+accountability log readable without logging in defeats its own purpose. Joins against
+`users` so each entry returns a human-readable `actor_email`, not just a raw UUID.
 
 `GET /api/v1/traffic/` and `/anomalies` are backed by real ClickHouse queries
 (`backend/core/clickhouse.py` + `routes/traffic.py`), run via `run_in_threadpool` since
@@ -361,8 +378,39 @@ Thresholds:
 `sandbox_result["mode"]` (`"host"`, `"router"`, or `"output"`) is recorded for every
 test, so a rule's stored history always shows which mode validated it.
 
-`sandbox_result["mode"]` (`"host"`, `"router"`, or `"output"`) is recorded for every
-test, so a rule's stored history always shows which mode validated it.
+Before the pass/fail verdict is decided, the candidate is also checked for policy
+conflicts against every currently-`LIVE` rule (`sandbox/conflict_checker.py`) — see
+"Policy conflict checking" below.
+
+---
+
+## Policy conflict checking
+
+Implemented in `sandbox/conflict_checker.py`, called from `run_sandbox_test()` right
+after `score_replay()`. Every candidate is compared against every currently-`LIVE` rule
+(`promoter.get_live_rules()`) for:
+- **duplicate** — another `LIVE` rule matches identical traffic with the same effective
+  action (redundant, not necessarily wrong)
+- **contradictory** — another `LIVE` rule matches identical traffic with the *opposing*
+  action (one `ACCEPT`s what the other `DROP`/`REJECT`s)
+
+Match fields (`src`, `dst`, `dport`, `protocol`) and each rule's effective action (the
+last non-`LOG` `-j` target — every real generated rule LOG-before-DROPs, per
+`rule_gen.txt`) are extracted via regex, the same lightweight-parsing approach
+`_detect_chain()` already uses — not a full iptables grammar.
+
+**This never affects `passed`, `fp_rate`, or `detection_rate`.** Results land in
+`sandbox_result["policy_conflicts"]` (empty list if none) regardless of which branch the
+rule takes — a human reviewer sees the conflict in the dashboard and decides; the system
+never auto-rejects on this basis. A conflict-check failure itself (e.g. a transient DB
+error) is caught and logged, never allowed to block an otherwise-earned verdict.
+
+**Known limitation**: matching is exact-tuple equality on `(src, dst, dport, protocol)`,
+not semantic overlap — a rule with `-p tcp` and an otherwise-identical rule with no `-p`
+at all (meaning "any protocol") are treated as non-conflicting, even though "any"
+actually subsumes "tcp". Deliberate, not an oversight: for an advisory feature, a missed
+conflict is a safer failure mode than a spurious warning that erodes trust in the
+feature. See ADR-046.
 
 ---
 
@@ -373,7 +421,7 @@ Implemented in `frontend/` (React + Vite + Tailwind v4 + Recharts + react-router
 ```
 src/api.js                      — central axios client; JWT interceptor, 401 -> logout
 src/hooks/useAuth.js            — AuthContext/AuthProvider, login/logout, current user
-src/hooks/useRules.js           — fetch + filter rules by status, approve/reject actions
+src/hooks/useRules.js           — fetch + filter rules by status, approve/reject/revoke actions
 src/hooks/useTraffic.js         — fetch traffic events / anomalies
 src/hooks/useDashboardStats.js  — fetch dashboard stats (added — see ADR-024)
 src/hooks/useWebSocket.js       — manage the alert WebSocket connection (added — ADR-024)
@@ -382,9 +430,16 @@ src/pages/                      — Login, Dashboard, Rules, Traffic
 ```
 
 This is a human-in-the-loop review UI for a security analyst: the Rules page has
-PENDING/APPROVED_PENDING/LIVE/REJECTED tabs, and Approve/Reject buttons on a RuleCard
-only render when `status === 'APPROVED_PENDING'` — matching the HITL hard rule (AI
-suggests, human approves) exactly.
+PENDING/APPROVED_PENDING/LIVE/REJECTED/REVOKED tabs (REVOKED added after ADR-045's Revoke
+button shipped without one — a revoked rule had nowhere to be viewed and effectively
+disappeared from the dashboard entirely; fixed by adding it to `Rules.jsx`'s `TABS`
+array, same pattern as the rest), Approve/Reject buttons on a RuleCard only
+render when `status === 'APPROVED_PENDING'`, and a Revoke button only renders when
+`status === 'LIVE'` (behind a confirm prompt) — matching the HITL hard rule (AI suggests,
+human approves) exactly. A RuleCard for an `APPROVED_PENDING` rule with any
+`sandbox_result.policy_conflicts` also renders an amber warning banner listing each
+conflict, so a reviewer sees it before clicking Approve — see "Policy conflict checking"
+above and ADR-045/ADR-046.
 
 The JWT lives in `localStorage` (see ADR-025) since this is a standalone Vite app, not
 a sandboxed artifact. Protected routes redirect to `/login` when unauthenticated.
@@ -398,6 +453,13 @@ button, confirmed the rule moved from APPROVED_PENDING to LIVE in Postgres, and 
 the resulting WebSocket alert appear live in the banner regardless of which page was
 open at the time. The traffic/WebSocket gaps flagged in the previous version of this doc
 are closed — see the API endpoints section above and ADR-029 through ADR-033.
+
+**The Revoke button and policy-conflict banner (ADR-045/ADR-046) were not verified this
+same way** — no browser automation tool was available in that session. What was
+confirmed instead: `npm run build` and `npm run lint` both pass, and the exact API
+response shape each new UI piece depends on was confirmed correct via real authenticated
+API calls. Neither was actually clicked in a running browser. Stated here plainly rather
+than left implicit — revisit with a browser tool when one is available.
 
 ---
 
